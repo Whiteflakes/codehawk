@@ -51,8 +51,9 @@ class EmbeddingGenerator:
             self.load_model()
 
         if self.model is None:
-            # Return mock embedding for testing
-            return np.random.rand(self.dimension).astype(np.float32)
+            # Return None for production use - mock embeddings only for testing
+            logger.warning("Embedding model not loaded, returning None")
+            return None
 
         try:
             embedding = self.model.encode(text, convert_to_numpy=True)
@@ -75,8 +76,9 @@ class EmbeddingGenerator:
             self.load_model()
 
         if self.model is None:
-            # Return mock embeddings for testing
-            return [np.random.rand(self.dimension).astype(np.float32) for _ in texts]
+            # Return None values for production use
+            logger.warning("Embedding model not loaded, returning None values")
+            return [None] * len(texts)
 
         try:
             embeddings = self.model.encode(texts, convert_to_numpy=True)

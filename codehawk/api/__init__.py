@@ -3,6 +3,7 @@
 import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -12,14 +13,29 @@ from codehawk.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Global context engine instance
+engine: Optional[ContextEngine] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan."""
+    global engine
+    logger.info("Starting CodeHawk API")
+    engine = ContextEngine()
+    engine.initialize()
+    yield
+    if engine:
+        engine.shutdown()
+    logger.info("Shutdown CodeHawk API")
+
+
 app = FastAPI(
     title="CodeHawk API",
     description="Code context engine API",
     version="0.1.0",
+    lifespan=lifespan,
 )
-
-# Global context engine instance
-engine: Optional[ContextEngine] = None
 
 
 class SearchRequest(BaseModel):
@@ -67,24 +83,6 @@ class IndexResponse(BaseModel):
 
     repository_id: int
     message: str
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the context engine on startup."""
-    global engine
-    logger.info("Starting CodeHawk API")
-    engine = ContextEngine()
-    engine.initialize()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown the context engine."""
-    global engine
-    if engine:
-        engine.shutdown()
-    logger.info("Shutdown CodeHawk API")
 
 
 @app.get("/")

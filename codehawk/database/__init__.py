@@ -145,6 +145,8 @@ class Database:
 
                 # Create indexes
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);")
+                # IVFFlat index - lists parameter should be sqrt(total_rows) for optimal performance
+                # Starting with 100, but should be adjusted based on dataset size in production
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_repository_id ON files(repository_id);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_commits_repository_id ON commits(repository_id);")

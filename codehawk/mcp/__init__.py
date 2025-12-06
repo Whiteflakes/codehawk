@@ -4,6 +4,7 @@ import logging
 import json
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -13,14 +14,29 @@ from codehawk.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Global context engine instance
+engine: Optional[ContextEngine] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan."""
+    global engine
+    logger.info("Starting CodeHawk MCP server")
+    engine = ContextEngine()
+    engine.initialize()
+    yield
+    if engine:
+        engine.shutdown()
+    logger.info("Shutdown CodeHawk MCP server")
+
+
 app = FastAPI(
     title="CodeHawk MCP Server",
     description="Model Context Protocol server for code context",
     version="0.1.0",
+    lifespan=lifespan,
 )
-
-# Global context engine instance
-engine: Optional[ContextEngine] = None
 
 
 class MCPRequest(BaseModel):
@@ -37,24 +53,6 @@ class MCPResponse(BaseModel):
     result: Optional[Any] = None
     error: Optional[Dict[str, Any]] = None
     id: Optional[str] = None
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the context engine on startup."""
-    global engine
-    logger.info("Starting CodeHawk MCP server")
-    engine = ContextEngine()
-    engine.initialize()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown the context engine."""
-    global engine
-    if engine:
-        engine.shutdown()
-    logger.info("Shutdown CodeHawk MCP server")
 
 
 @app.get("/")
