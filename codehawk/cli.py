@@ -3,7 +3,8 @@
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 import click
 
@@ -51,9 +52,40 @@ def index(repository_path: str, url: Optional[str], db_url: Optional[str]):
 @main.command()
 @click.argument("query")
 @click.option("--limit", default=10, help="Maximum number of results")
-@click.option("--repository-id", type=int, help="Filter by repository ID")
+@click.option(
+    "--repository-id",
+    type=int,
+    multiple=True,
+    help="Filter by repository ID (can be provided multiple times)",
+)
+@click.option(
+    "--language",
+    multiple=True,
+    help="Filter by language (can be provided multiple times)",
+)
+@click.option(
+    "--since",
+    type=click.DateTime(),
+    help="Only include chunks created on/after this timestamp (ISO format)",
+)
+@click.option("--use-lexical/--no-lexical", default=False, help="Blend lexical/BM25 signals")
+@click.option(
+    "--lexical-weight",
+    default=0.3,
+    show_default=True,
+    help="Weight to give lexical/BM25 scoring when blending with vectors",
+)
 @click.option("--db-url", help="Database connection URL", default=None)
-def search(query: str, limit: int, repository_id: Optional[int], db_url: Optional[str]):
+def search(
+    query: str,
+    limit: int,
+    repository_id: Optional[int],
+    language: Optional[List[str]],
+    since: Optional[datetime],
+    use_lexical: bool,
+    lexical_weight: float,
+    db_url: Optional[str],
+):
     """Search for code chunks."""
     click.echo(f"Searching for: {query}")
     
@@ -61,7 +93,17 @@ def search(query: str, limit: int, repository_id: Optional[int], db_url: Optiona
         engine = ContextEngine(database_url=db_url)
         engine.initialize()
         
-        results = engine.search(query, limit=limit, repository_id=repository_id)
+        repository_ids = list(repository_id) if repository_id else None
+
+        results = engine.search(
+            query,
+            limit=limit,
+            repository_ids=repository_ids,
+            languages=list(language) if language else None,
+            since=since,
+            use_lexical=use_lexical,
+            lexical_weight=lexical_weight,
+        )
         
         if not results:
             click.echo("No results found.")
@@ -72,7 +114,9 @@ def search(query: str, limit: int, repository_id: Optional[int], db_url: Optiona
                 click.echo(f"{i}. {result['file_path']} (lines {result['start_line']}-{result['end_line']})")
                 click.echo(f"   Repository: {result['repository']}")
                 click.echo(f"   Type: {result['chunk_type']} | Language: {result['language']}")
-                click.echo(f"   Similarity: {result['similarity']:.4f}")
+                click.echo(
+                    f"   Similarity: {result['similarity']:.4f} | Score: {result.get('combined_score', result['similarity']):.4f}"
+                )
                 click.echo(f"\n   {result['content'][:200]}...")
                 click.echo()
         
