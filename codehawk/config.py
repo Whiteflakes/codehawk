@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # Embedding settings
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
+    embedding_offline_mode: bool = False
     chunk_size: int = 512
     chunk_overlap: int = 50
 

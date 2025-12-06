@@ -2,53 +2,58 @@
 
 import pytest
 import numpy as np
+
 from codehawk.embeddings import EmbeddingGenerator
 from codehawk.chunker import CodeChunk
 
 
-def test_embedder_initialization():
+@pytest.fixture
+def offline_embedder():
+    """Create an embedder forced into offline mode."""
+
+    embedder = EmbeddingGenerator(offline_mode=True)
+    # Avoid actually loading sentence-transformers when offline testing
+    embedder._try_load_sentence_transformer = lambda: False  # type: ignore[attr-defined]
+    return embedder
+
+
+def test_embedder_initialization(offline_embedder):
     """Test embedder initialization."""
-    embedder = EmbeddingGenerator()
-    assert embedder.model_name == "sentence-transformers/all-MiniLM-L6-v2"
-    assert embedder.dimension == 384
+    assert offline_embedder.model_name == "sentence-transformers/all-MiniLM-L6-v2"
+    assert offline_embedder.dimension == 384
 
 
-def test_generate_embedding():
+def test_generate_embedding(offline_embedder):
     """Test embedding generation."""
-    embedder = EmbeddingGenerator()
-    
+
     text = "This is a test string for embedding"
-    embedding = embedder.generate_embedding(text)
-    
-    assert embedding is not None
+    embedding = offline_embedder.generate_embedding(text)
+
     assert isinstance(embedding, np.ndarray)
-    assert embedding.shape == (embedder.dimension,)
+    assert embedding.shape == (offline_embedder.dimension,)
     assert embedding.dtype == np.float32
 
 
-def test_generate_embeddings_batch():
+def test_generate_embeddings_batch(offline_embedder):
     """Test batch embedding generation."""
-    embedder = EmbeddingGenerator()
-    
+
     texts = [
         "First test string",
         "Second test string",
         "Third test string",
     ]
-    
-    embeddings = embedder.generate_embeddings(texts)
-    
+
+    embeddings = offline_embedder.generate_embeddings(texts)
+
     assert len(embeddings) == len(texts)
     for embedding in embeddings:
-        assert embedding is not None
         assert isinstance(embedding, np.ndarray)
-        assert embedding.shape == (embedder.dimension,)
+        assert embedding.shape == (offline_embedder.dimension,)
 
 
-def test_generate_chunk_embedding():
+def test_generate_chunk_embedding(offline_embedder):
     """Test embedding generation for code chunk."""
-    embedder = EmbeddingGenerator()
-    
+
     chunk = CodeChunk(
         content="def hello():\n    print('hello')",
         file_path="test.py",
@@ -60,17 +65,16 @@ def test_generate_chunk_embedding():
         language="python",
         metadata={"name": "hello"},
     )
-    
-    embedding = embedder.generate_chunk_embedding(chunk)
-    
-    assert embedding is not None
+
+    embedding = offline_embedder.generate_chunk_embedding(chunk)
+
     assert isinstance(embedding, np.ndarray)
-    assert embedding.shape == (embedder.dimension,)
+    assert embedding.shape == (offline_embedder.dimension,)
 
 
 def test_enhance_chunk_text():
     """Test chunk text enhancement."""
-    embedder = EmbeddingGenerator()
+    embedder = EmbeddingGenerator(offline_mode=True)
     
     chunk = CodeChunk(
         content="def test():\n    pass",
@@ -90,3 +94,25 @@ def test_enhance_chunk_text():
     assert "Type: function_definition" in enhanced
     assert "Name: test" in enhanced
     assert chunk.content in enhanced
+
+
+def test_offline_fallback_when_download_fails(monkeypatch):
+    """Offline mode should fallback to deterministic backend when download fails."""
+
+    embedder = EmbeddingGenerator(offline_mode=True)
+    monkeypatch.setattr(embedder, "_try_load_sentence_transformer", lambda: False)
+
+    embeddings = embedder.generate_embeddings(["a", "b"])
+
+    assert len(embeddings) == 2
+    assert all(isinstance(embedding, np.ndarray) for embedding in embeddings)
+
+
+def test_error_surface_when_no_backend_available(monkeypatch):
+    """Without offline mode, failures should raise instead of returning None."""
+
+    embedder = EmbeddingGenerator(offline_mode=False)
+    monkeypatch.setattr(embedder, "_try_load_sentence_transformer", lambda: False)
+
+    with pytest.raises(RuntimeError):
+        embedder.generate_embedding("text")
