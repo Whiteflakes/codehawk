@@ -3,11 +3,18 @@
 import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-import psycopg2
-from psycopg2.extras import execute_values
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Optional dependency - fail gracefully if not available
+try:
+    import psycopg2
+    from psycopg2.extras import execute_values
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+    logger.warning("psycopg2 not available - database features will be disabled")
 
 
 class Database:
@@ -20,6 +27,9 @@ class Database:
         Args:
             connection_string: PostgreSQL connection string
         """
+        if not PSYCOPG2_AVAILABLE:
+            raise ImportError("psycopg2 is required for database features. Install with: pip install psycopg2-binary")
+        
         self.connection_string = connection_string
         self.conn: Optional[psycopg2.extensions.connection] = None
 

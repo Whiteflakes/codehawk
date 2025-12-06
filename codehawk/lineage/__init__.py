@@ -4,9 +4,16 @@ import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
-import git
 
 logger = logging.getLogger(__name__)
+
+# Optional dependency - fail gracefully if not available
+try:
+    import git
+    GIT_AVAILABLE = True
+except ImportError:
+    GIT_AVAILABLE = False
+    logger.warning("GitPython not available - lineage tracking features will be disabled")
 
 
 class LineageTracker:
@@ -19,6 +26,9 @@ class LineageTracker:
         Args:
             repository_path: Path to git repository
         """
+        if not GIT_AVAILABLE:
+            raise ImportError("GitPython is required for lineage tracking. Install with: pip install GitPython")
+        
         self.repository_path = repository_path
         self.repo: Optional[git.Repo] = None
 
