@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import os
+from datetime import datetime
 
 from codehawk.parser import TreeSitterParser
 from codehawk.chunker import CodeChunker, CodeChunk
@@ -200,14 +201,29 @@ class ContextEngine:
                 except Exception as e:
                     logger.debug(f"Error inserting relation: {e}")
 
-    def search(self, query: str, limit: int = 10, repository_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        repository_id: Optional[int] = None,
+        repository_ids: Optional[List[int]] = None,
+        languages: Optional[List[str]] = None,
+        since: Optional[datetime] = None,
+        use_lexical: bool = False,
+        lexical_weight: float = 0.3,
+    ) -> List[Dict[str, Any]]:
         """
         Search for code chunks similar to query.
 
         Args:
             query: Search query
             limit: Maximum number of results
-            repository_id: Optional repository filter
+            repository_id: Optional repository filter (deprecated, use repository_ids)
+            repository_ids: Optional list of repository IDs
+            languages: Optional list of languages to filter
+            since: Optional recency cutoff timestamp
+            use_lexical: Blend vector search with lexical/BM25 scoring
+            lexical_weight: Weight to give lexical scoring when blending
 
         Returns:
             List of matching chunks
@@ -221,7 +237,17 @@ class ContextEngine:
             return []
 
         # Search database
-        results = self.db.search_chunks(query_embedding, limit, repository_id)
+        results = self.db.search_chunks(
+            query_embedding,
+            limit=limit,
+            repository_id=repository_id,
+            repository_ids=repository_ids,
+            languages=languages,
+            since=since,
+            use_lexical=use_lexical,
+            lexical_weight=lexical_weight,
+            query_text=query,
+        )
         return results
 
     def get_context_pack(

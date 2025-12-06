@@ -246,51 +246,106 @@ class Database:
         query_embedding: np.ndarray,
         limit: int = 10,
         repository_id: Optional[int] = None,
+        repository_ids: Optional[List[int]] = None,
+        languages: Optional[List[str]] = None,
+        since: Optional[datetime] = None,
+        use_lexical: bool = False,
+        lexical_weight: float = 0.3,
+        query_text: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar chunks using vector similarity.
+        Search for similar chunks using vector similarity with optional lexical/BM25 blending.
 
         Args:
             query_embedding: Query embedding vector
             limit: Maximum number of results
-            repository_id: Optional repository filter
+            repository_id: Optional single repository filter (backward compatibility)
+            repository_ids: Optional list of repository IDs to filter
+            languages: Optional list of languages to filter
+            since: Optional timestamp filter to prefer recent chunks
+            use_lexical: Whether to add lexical/BM25-style scoring
+            lexical_weight: Weight for lexical score when blending with vector similarity
+            query_text: Raw query text used for lexical scoring
 
         Returns:
             List of matching chunks with metadata
         """
+        if not self.conn:
+            raise RuntimeError("Database connection not initialized")
+
+        # Normalize repository filters for backward compatibility
+        repo_filters = repository_ids or []
+        if repository_id and repository_id not in repo_filters:
+            repo_filters.append(repository_id)
+
+        # Clamp lexical weight to [0, 1]
+        lexical_weight = max(0.0, min(1.0, lexical_weight))
+        vector_weight = 1.0 - lexical_weight
+
         with self.conn.cursor() as cur:
-            if repository_id:
-                cur.execute(
-                    """
-                    SELECT c.id, c.content, c.start_line, c.end_line, c.chunk_type,
-                           c.language, c.metadata, f.path, r.name as repository_name,
-                           1 - (c.embedding <=> %s::vector) as similarity
-                    FROM chunks c
-                    JOIN files f ON c.file_id = f.id
-                    JOIN repositories r ON f.repository_id = r.id
-                    WHERE r.id = %s
-                    ORDER BY c.embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (query_embedding.tolist(), repository_id, query_embedding.tolist(), limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT c.id, c.content, c.start_line, c.end_line, c.chunk_type,
-                           c.language, c.metadata, f.path, r.name as repository_name,
-                           1 - (c.embedding <=> %s::vector) as similarity
-                    FROM chunks c
-                    JOIN files f ON c.file_id = f.id
-                    JOIN repositories r ON f.repository_id = r.id
-                    ORDER BY c.embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (query_embedding.tolist(), query_embedding.tolist(), limit),
-                )
+            conditions: List[str] = []
+            params: List[Any] = []
+
+            lexical_select = "NULL::float AS lexical_score"
+            if use_lexical and query_text:
+                lexical_select = "ts_rank_cd(to_tsvector('english', c.content), plainto_tsquery(%s)) AS lexical_score"
+                params.append(query_text)
+
+            # Vector similarity score
+            vector_score_select = "1 - (c.embedding <=> %s::vector) AS vector_score"
+            params.append(query_embedding.tolist())
+
+            if repo_filters:
+                conditions.append("r.id = ANY(%s)")
+                params.append(repo_filters)
+
+            if languages:
+                conditions.append("c.language = ANY(%s)")
+                params.append(languages)
+
+            if since:
+                conditions.append("c.created_at >= %s")
+                params.append(since)
+
+            where_clause = ""
+            if conditions:
+                where_clause = "WHERE " + " AND ".join(conditions)
+
+            inner_select = f"""
+                SELECT c.id, c.content, c.start_line, c.end_line, c.chunk_type,
+                       c.language, c.metadata, f.path, r.name as repository_name,
+                       {vector_score_select},
+                       {lexical_select}
+                FROM chunks c
+                JOIN files f ON c.file_id = f.id
+                JOIN repositories r ON f.repository_id = r.id
+                {where_clause}
+            """
+
+            order_clause = "ranked.vector_score DESC"
+            if use_lexical and query_text:
+                order_clause = "combined_score DESC, ranked.vector_score DESC"
+
+            query = f"""
+                SELECT ranked.*, (%s * ranked.vector_score + %s * COALESCE(ranked.lexical_score, 0)) AS combined_score
+                FROM (
+                    {inner_select}
+                ) ranked
+                ORDER BY {order_clause}
+                LIMIT %s;
+            """
+
+            # Parameter order matches placeholders in query
+            execute_params: List[Any] = [vector_weight, lexical_weight]
+            execute_params.extend(params)
+            execute_params.append(limit)
+
+            cur.execute(query, execute_params)
 
             results = []
             for row in cur.fetchall():
+                lexical_value = None if not use_lexical else (None if row[10] is None else float(row[10]))
+
                 results.append({
                     "id": row[0],
                     "content": row[1],
@@ -302,7 +357,15 @@ class Database:
                     "file_path": row[7],
                     "repository": row[8],
                     "similarity": float(row[9]),
+                    "lexical_score": lexical_value,
                 })
+
+            # Apply blended score locally to ensure deterministic ordering for tests/fallbacks
+            for result in results:
+                lexical_score = result.get("lexical_score") or 0.0
+                result["combined_score"] = vector_weight * result["similarity"] + lexical_weight * lexical_score
+
+            results.sort(key=lambda r: r["combined_score"], reverse=True)
 
             return results
 

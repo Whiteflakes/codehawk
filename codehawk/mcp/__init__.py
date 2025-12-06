@@ -130,8 +130,22 @@ async def process_mcp_request(request: MCPRequest) -> MCPResponse:
             query = request.params.get("query", "")
             limit = request.params.get("limit", 10)
             repository_id = request.params.get("repository_id")
-            
-            results = engine.search(query, limit, repository_id)
+            repository_ids = request.params.get("repository_ids")
+            languages = request.params.get("languages")
+            since = request.params.get("since")
+            use_lexical = request.params.get("use_lexical", False)
+            lexical_weight = request.params.get("lexical_weight", 0.3)
+
+            results = engine.search(
+                query,
+                limit,
+                repository_id=repository_id,
+                repository_ids=repository_ids,
+                languages=languages,
+                since=since,
+                use_lexical=use_lexical,
+                lexical_weight=lexical_weight,
+            )
             
             return MCPResponse(
                 result={"chunks": results},

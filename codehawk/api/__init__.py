@@ -4,6 +4,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -43,7 +44,12 @@ class SearchRequest(BaseModel):
 
     query: str = Field(..., description="Search query")
     limit: int = Field(10, ge=1, le=100, description="Maximum number of results")
-    repository_id: Optional[int] = Field(None, description="Optional repository filter")
+    repository_id: Optional[int] = Field(None, description="Optional repository filter (deprecated, use repository_ids)")
+    repository_ids: Optional[List[int]] = Field(None, description="Optional repository filters")
+    languages: Optional[List[str]] = Field(None, description="Language filters")
+    since: Optional[datetime] = Field(None, description="Only include chunks created after this timestamp")
+    use_lexical: bool = Field(False, description="Blend vector search with lexical/BM25")
+    lexical_weight: float = Field(0.3, ge=0.0, le=1.0, description="Weight for lexical scoring")
 
 
 class SearchResponse(BaseModel):
@@ -120,6 +126,11 @@ async def search(request: SearchRequest):
             query=request.query,
             limit=request.limit,
             repository_id=request.repository_id,
+            repository_ids=request.repository_ids,
+            languages=request.languages,
+            since=request.since,
+            use_lexical=request.use_lexical,
+            lexical_weight=request.lexical_weight,
         )
         
         return SearchResponse(
