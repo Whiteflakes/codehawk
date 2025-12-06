@@ -1,8 +1,9 @@
 """Context engine that orchestrates all components."""
 
+import hashlib
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import os
 from datetime import datetime
 
@@ -10,7 +11,7 @@ from codehawk.parser import TreeSitterParser
 from codehawk.chunker import CodeChunker, CodeChunk
 from codehawk.embeddings import EmbeddingGenerator
 from codehawk.database import Database
-from codehawk.graph import GraphAnalyzer
+from codehawk.graph import GraphAnalyzer, GraphUpdatePlanner
 from codehawk.lineage import LineageTracker
 from codehawk.config import settings
 
@@ -42,6 +43,7 @@ class ContextEngine:
         )
         self.embedder = EmbeddingGenerator(model_name=self.embedding_model)
         self.graph_analyzer = GraphAnalyzer()
+        self.graph_update_planner = GraphUpdatePlanner(self.graph_analyzer)
         
         self.db: Optional[Database] = None
 
@@ -104,21 +106,68 @@ class ContextEngine:
             logger.warning(f"Error indexing commit history: {e}")
 
         # Index files
-        indexed_files = 0
-        for file_path in self._get_code_files(repo_path):
-            try:
-                self.index_file(repo_id, file_path, repo_path)
-                indexed_files += 1
-                
-                if indexed_files % 10 == 0:
-                    logger.info(f"Indexed {indexed_files} files")
-            except Exception as e:
-                logger.error(f"Error indexing {file_path}: {e}")
-
-        logger.info(f"Indexed {indexed_files} files from repository")
+        try:
+            self.index_directory(repo_id, repo_path)
+        except Exception as e:
+            logger.error(f"Error indexing repository files: {e}")
+        logger.info(f"Indexed repository contents for {repo_name}")
         return repo_id
 
-    def index_file(self, repository_id: int, file_path: Path, repo_path: Path):
+    def index_directory(self, repository_id: int, repo_path: Path) -> None:
+        """Index a directory with change detection and cleanup."""
+        if not self.db:
+            raise RuntimeError("Database not initialized")
+
+        current_files = self._get_code_files(repo_path)
+        current_paths = {str(path.relative_to(repo_path)) for path in current_files}
+
+        existing_files = self.db.get_files_for_repository(repository_id)
+        missing_paths = set(existing_files.keys()) - current_paths
+
+        if missing_paths:
+            logger.info(f"Removing {len(missing_paths)} deleted files from index")
+            self.db.delete_files(repository_id, list(missing_paths))
+
+        for file_path in current_files:
+            relative_path = str(file_path.relative_to(repo_path))
+            content_bytes = file_path.read_bytes()
+            content_hash = self._hash_content(content_bytes)
+            modified_at = datetime.fromtimestamp(file_path.stat().st_mtime)
+
+            previous = existing_files.get(relative_path)
+            if previous and previous.get("content_hash") == content_hash:
+                prev_mtime = previous.get("modified_at")
+                if prev_mtime and prev_mtime.replace(microsecond=0) == modified_at.replace(microsecond=0):
+                    logger.debug(f"Skipping unchanged file: {relative_path}")
+                    continue
+
+            try:
+                source_code = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.warning(f"Could not decode file, skipping: {relative_path}")
+                continue
+
+            self.index_file(
+                repository_id,
+                file_path,
+                repo_path,
+                source_code=source_code,
+                content_hash=content_hash,
+                modified_at=modified_at,
+            )
+
+    def index_file(
+        self,
+        repository_id: int,
+        file_path: Path,
+        repo_path: Path,
+        fingerprint: Optional[str] = None,
+        reconcile: bool = False,
+    ) -> Dict[str, Any]:
+        source_code: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        modified_at: Optional[datetime] = None,
+    ):
         """
         Index a single file.
 
@@ -140,24 +189,49 @@ class ContextEngine:
 
         # Read file
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                source_code = f.read()
+            if source_code is None:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    source_code = f.read()
         except Exception as e:
             logger.error(f"Error reading {file_path}: {e}")
             return
+
+        content_hash = content_hash or self._hash_content(source_code.encode("utf-8"))
+        modified_at = modified_at or datetime.fromtimestamp(file_path.stat().st_mtime)
 
         # Check file size
         if len(source_code) > settings.max_file_size:
             logger.warning(f"File too large, skipping: {file_path}")
             return
 
-        # Create file record
-        file_id = self.db.insert_file(
+        fingerprint = fingerprint or self._compute_fingerprint(repo_path, file_path, source_code)
+
+        file_id = None
+        if reconcile and fingerprint:
+            existing = self.db.find_file_by_fingerprint(repository_id, fingerprint)
+            if existing:
+                file_id = existing["id"]
+                if existing["path"] != str(relative_path):
+                    self.db.update_file_path(file_id, str(relative_path))
+
+        # Create or update file record
+        file_id = file_id or self.db.insert_file(
             repository_id=repository_id,
             path=str(relative_path),
             language=language,
             size_bytes=len(source_code.encode("utf-8")),
+            fingerprint=fingerprint,
+            content_hash=content_hash,
+            modified_at=modified_at,
         )
+
+        if reconcile:
+            # Clean stale graph + lineage data before re-inserting
+            existing_chunk_ids = self.db.get_chunk_ids_for_file(file_id)
+            if existing_chunk_ids:
+                self.db.delete_relations_for_chunks(existing_chunk_ids)
+            self.db.delete_lineage_for_files([file_id])
+            self.db.delete_chunks_for_file(file_id)
 
         # Parse file
         tree = self.parser.parse_file(file_path, language)
@@ -166,29 +240,38 @@ class ContextEngine:
         chunks = self.chunker.chunk_file(file_path, tree, language, source_code)
 
         # Generate embeddings and store chunks
-        chunk_ids = []
-        for chunk in chunks:
-            embedding = self.embedder.generate_chunk_embedding(chunk)
-            if embedding is not None:
-                chunk_id = self.db.insert_chunk(
-                    file_id=file_id,
-                    content=chunk.content,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                    start_byte=chunk.start_byte,
-                    end_byte=chunk.end_byte,
-                    chunk_type=chunk.chunk_type,
-                    language=chunk.language,
-                    metadata=chunk.metadata,
-                    embedding=embedding,
-                )
-                chunk_ids.append(chunk_id)
+        enhanced_chunks: List[Tuple[CodeChunk, str]] = [
+            (chunk, self.embedder._enhance_chunk_text(chunk)) for chunk in chunks
+        ]
+        embeddings = self.embedder.generate_embeddings([text for _, text in enhanced_chunks])
+
+        chunk_records = []
+        filtered_chunks: List[CodeChunk] = []
+        for chunk, embedding in zip(chunks, embeddings):
+            if embedding is None:
+                continue
+            filtered_chunks.append(chunk)
+            chunk_records.append(
+                {
+                    "content": chunk.content,
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                    "start_byte": chunk.start_byte,
+                    "end_byte": chunk.end_byte,
+                    "chunk_type": chunk.chunk_type,
+                    "language": chunk.language,
+                    "metadata": chunk.metadata,
+                    "embedding": embedding,
+                }
+            )
+
+        chunk_ids = self.db.insert_chunks_batch(file_id=file_id, chunks=chunk_records)
 
         # Analyze relationships
         if chunk_ids:
-            relations = self.graph_analyzer.analyze_imports(chunks, chunk_ids)
-            relations.extend(self.graph_analyzer.analyze_calls(chunks, chunk_ids))
-            relations.extend(self.graph_analyzer.analyze_inheritance(chunks, chunk_ids))
+            relations = self.graph_analyzer.analyze_imports(filtered_chunks, chunk_ids)
+            relations.extend(self.graph_analyzer.analyze_calls(filtered_chunks, chunk_ids))
+            relations.extend(self.graph_analyzer.analyze_inheritance(filtered_chunks, chunk_ids))
 
             for relation in relations:
                 try:
@@ -201,6 +284,73 @@ class ContextEngine:
                 except Exception as e:
                     logger.debug(f"Error inserting relation: {e}")
 
+        return {"file_id": file_id, "chunk_ids": chunk_ids}
+
+    def update_changed_files(
+        self,
+        repository_id: int,
+        repo_path: Path,
+        base_commit: str,
+        target_commit: str = "HEAD",
+    ) -> Dict[str, Any]:
+        """Re-index only files touched between two commits with reconciliation."""
+
+        lineage = LineageTracker(repo_path)
+        lineage.open_repository()
+        changes = lineage.detect_changes(base_commit, target_commit)
+
+        changed_chunk_ids: List[int] = []
+        file_ids: List[int] = []
+
+        for change in changes:
+            file_path = repo_path / change.path
+            result = self.index_file(
+                repository_id,
+                file_path,
+                repo_path,
+                fingerprint=change.fingerprint,
+                reconcile=True,
+            )
+            changed_chunk_ids.extend(result.get("chunk_ids", []))
+            if result.get("file_id"):
+                file_ids.append(result["file_id"])
+
+        # Identify ancestors to re-run graph analysis on
+        existing_relations = self.db.get_relations_by_target_ids(changed_chunk_ids)
+        relation_objects = [
+            CodeRelation(
+                source_chunk_id=rel["source_chunk_id"],
+                target_chunk_id=rel["target_chunk_id"],
+                relation_type=rel["relation_type"],
+                metadata=rel.get("metadata", {}),
+            )
+            for rel in existing_relations
+        ]
+
+        impacted_chunk_ids = self.graph_update_planner.impacted_chunks(
+            relation_objects, set(changed_chunk_ids)
+        )
+        if impacted_chunk_ids:
+            self.db.delete_relations_for_chunks(list(impacted_chunk_ids))
+
+        return {
+            "changes": changes,
+            "impacted_chunk_ids": impacted_chunk_ids,
+            "file_ids": file_ids,
+        }
+
+    def _compute_fingerprint(
+        self, repo_path: Path, file_path: Path, content: str
+    ) -> Optional[str]:
+        try:
+            lineage = LineageTracker(repo_path)
+            lineage.open_repository()
+            return lineage.get_blob_fingerprint(file_path)
+        except Exception:
+            import hashlib
+
+            return hashlib.sha1(content.encode("utf-8")).hexdigest()
+
     def search(
         self,
         query: str,
@@ -211,6 +361,14 @@ class ContextEngine:
         since: Optional[datetime] = None,
         use_lexical: bool = False,
         lexical_weight: float = 0.3,
+        reranker: Optional[Callable[[List[Dict[str, Any]], str], List[float]]] = None,
+        rerank_weight: float = 0.4,
+        rerank_top_k: Optional[int] = None,
+        deduplicate: bool = True,
+        dedup_threshold: float = 0.97,
+        boost_top_level: float = 0.05,
+        boost_recent_edit: float = 0.05,
+        filter_match_boost: float = 0.02,
     ) -> List[Dict[str, Any]]:
         """
         Search for code chunks similar to query.
@@ -224,6 +382,14 @@ class ContextEngine:
             since: Optional recency cutoff timestamp
             use_lexical: Blend vector search with lexical/BM25 scoring
             lexical_weight: Weight to give lexical scoring when blending
+            reranker: Optional cross-encoder reranker callable
+            rerank_weight: Blend factor for reranker scores
+            rerank_top_k: Number of candidates to send to reranker
+            deduplicate: Drop near-identical snippets
+            dedup_threshold: Similarity threshold for deduplication
+            boost_top_level: Bonus for top-level definitions
+            boost_recent_edit: Bonus for recent edits
+            filter_match_boost: Bonus for repo/language filter matches
 
         Returns:
             List of matching chunks
@@ -247,6 +413,14 @@ class ContextEngine:
             use_lexical=use_lexical,
             lexical_weight=lexical_weight,
             query_text=query,
+            reranker=reranker,
+            rerank_weight=rerank_weight,
+            rerank_top_k=rerank_top_k,
+            deduplicate=deduplicate,
+            dedup_threshold=dedup_threshold,
+            boost_top_level=boost_top_level,
+            boost_recent_edit=boost_recent_edit,
+            filter_match_boost=filter_match_boost,
         )
         return results
 
@@ -319,3 +493,8 @@ class ContextEngine:
                     code_files.append(file_path)
 
         return code_files
+
+    @staticmethod
+    def _hash_content(content: bytes) -> str:
+        """Generate a stable hash for file content."""
+        return hashlib.sha256(content).hexdigest()

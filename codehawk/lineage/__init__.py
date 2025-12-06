@@ -1,6 +1,7 @@
 """Git commit lineage tracking."""
 
 import logging
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -31,6 +32,13 @@ class LineageTracker:
         
         self.repository_path = repository_path
         self.repo: Optional[git.Repo] = None
+
+    @dataclass
+    class FileChange:
+        path: str
+        change_type: str
+        fingerprint: Optional[str] = None
+        previous_path: Optional[str] = None
 
     def open_repository(self):
         """Open the git repository."""
@@ -73,6 +81,129 @@ class LineageTracker:
             logger.error(f"Error getting commits for {file_path}: {e}")
 
         return commits
+
+    def get_blob_fingerprint(self, file_path: Path, commit_hash: str = "HEAD") -> Optional[str]:
+        """Return the blob fingerprint for a file at a given commit."""
+        if not self.repo:
+            self.open_repository()
+
+        try:
+            relative_path = file_path.relative_to(self.repository_path)
+            commit = self.repo.commit(commit_hash)
+            blob = commit.tree / str(relative_path)
+            return blob.hexsha
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.debug(f"Unable to fingerprint {file_path} at {commit_hash}: {exc}")
+            return None
+
+    def get_commit_fingerprints(self, commit_hash: str = "HEAD") -> Dict[str, str]:
+        """Walk a commit tree to map file paths to blob fingerprints."""
+        if not self.repo:
+            self.open_repository()
+
+        commit = self.repo.commit(commit_hash)
+        fingerprints: Dict[str, str] = {}
+
+        def _walk_tree(tree, prefix: Path):
+            for item in tree:
+                if item.type == "blob":
+                    fingerprints[str(prefix / item.name)] = item.hexsha
+                elif item.type == "tree":
+                    _walk_tree(item, prefix / item.name)
+
+        _walk_tree(commit.tree, Path(""))
+        return fingerprints
+
+    def detect_changes(
+        self, base_commit: str, target_commit: str = "HEAD"
+    ) -> List["LineageTracker.FileChange"]:
+        """Detect file changes between commits with rename awareness."""
+        if not self.repo:
+            self.open_repository()
+
+        changes: List[LineageTracker.FileChange] = []
+        seen: set = set()
+
+        base_fingerprints = self.get_commit_fingerprints(base_commit)
+        target_fingerprints = self.get_commit_fingerprints(target_commit)
+
+        base_keys = set(base_fingerprints.keys())
+        target_keys = set(target_fingerprints.keys())
+        base_fingerprint_lookup = {v: k for k, v in base_fingerprints.items()}
+
+        # Direct diff including rename metadata
+        for diff in self.repo.commit(target_commit).diff(base_commit):
+            change_type = "modified"
+            path = diff.rename_to or diff.b_path or diff.a_path
+            previous_path = diff.rename_from if diff.renamed_file else None
+
+            if diff.new_file:
+                change_type = "added"
+            elif diff.deleted_file:
+                change_type = "deleted"
+            elif diff.renamed_file:
+                change_type = "renamed"
+
+            fingerprint = target_fingerprints.get(path or "")
+            if change_type == "deleted":
+                fingerprint = base_fingerprints.get(diff.a_path or "")
+            elif change_type == "renamed":
+                fingerprint = fingerprint or base_fingerprints.get(diff.a_path or "")
+                previous_path = base_fingerprint_lookup.get(fingerprint) or previous_path
+                if previous_path == path:
+                    previous_path = base_fingerprint_lookup.get(fingerprint, previous_path)
+                if fingerprint:
+                    for candidate_path, candidate_fp in base_fingerprints.items():
+                        if candidate_fp == fingerprint:
+                            previous_path = candidate_path
+                            break
+
+            change = LineageTracker.FileChange(
+                path=path or diff.a_path,
+                change_type=change_type,
+                fingerprint=fingerprint,
+                previous_path=previous_path,
+            )
+            key = (change.path, change.change_type, change.previous_path)
+            if key not in seen and (change_type != "renamed" or change.fingerprint):
+                seen.add(key)
+                changes.append(change)
+
+        # Detect renames by matching fingerprints when diff metadata is unavailable
+        base_only = base_keys - target_keys
+        target_only = target_keys - base_keys
+
+        fingerprint_lookup = {v: k for k, v in base_fingerprints.items()}
+        for path in list(target_only):
+            fingerprint = target_fingerprints[path]
+            if fingerprint in fingerprint_lookup:
+                changes.append(
+                    LineageTracker.FileChange(
+                        path=path,
+                        change_type="renamed",
+                        fingerprint=fingerprint,
+                        previous_path=fingerprint_lookup[fingerprint],
+                    )
+                )
+                base_only.discard(fingerprint_lookup[fingerprint])
+                target_only.discard(path)
+
+        # Remaining adds/deletes
+        for path in target_only:
+            changes.append(
+                LineageTracker.FileChange(
+                    path=path, change_type="added", fingerprint=target_fingerprints[path]
+                )
+            )
+
+        for path in base_only:
+            changes.append(
+                LineageTracker.FileChange(
+                    path=path, change_type="deleted", fingerprint=base_fingerprints[path]
+                )
+            )
+
+        return changes
 
     def get_recent_commits(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
