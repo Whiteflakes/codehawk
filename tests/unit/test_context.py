@@ -1,6 +1,9 @@
 import pytest
+import numpy as np
+from datetime import datetime
 
 from codehawk.context import ContextEngine
+from codehawk.chunker import CodeChunk
 
 
 class DummyDatabase:
@@ -72,3 +75,148 @@ def test_get_context_pack_respects_include_flags(monkeypatch):
     assert not engine.db.lineage_called
     assert context_pack["relations"] == []
     assert context_pack["lineage"] == []
+
+
+class DummyIndexDatabase:
+    def __init__(self, existing_files):
+        self.existing_files = existing_files
+        self.deleted = []
+        self.files_inserted = []
+
+    def get_files_for_repository(self, repository_id):
+        return self.existing_files
+
+    def delete_files(self, repository_id, paths):
+        self.deleted.extend(paths)
+
+
+def test_index_directory_skips_unchanged(tmp_path, monkeypatch):
+    """Unchanged files should be skipped when hashes and mtimes match."""
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = DummyIndexDatabase(existing_files={})
+    file_path = tmp_path / "app.py"
+    file_path.write_text("print('hello world')")
+
+    content_hash = engine._hash_content(file_path.read_bytes())
+    modified_at = datetime.fromtimestamp(file_path.stat().st_mtime)
+    engine.db.existing_files[str(file_path.relative_to(tmp_path))] = {
+        "id": 1,
+        "content_hash": content_hash,
+        "modified_at": modified_at,
+    }
+
+    calls = {"indexed": 0}
+    monkeypatch.setattr(engine, "_get_code_files", lambda path: [file_path])
+    monkeypatch.setattr(engine, "index_file", lambda *args, **kwargs: calls.__setitem__("indexed", calls["indexed"] + 1))
+
+    engine.index_directory(repository_id=1, repo_path=tmp_path)
+
+    assert calls["indexed"] == 0
+    assert engine.db.deleted == []
+
+
+class DummyBatchEmbedder:
+    def __init__(self):
+        self.calls = 0
+
+    def _enhance_chunk_text(self, chunk):
+        return chunk.content
+
+    def generate_embeddings(self, texts):
+        self.calls += 1
+        return [np.ones(4, dtype=np.float32) for _ in texts]
+
+
+class DummyBatchDb:
+    def __init__(self):
+        self.inserted_chunks = []
+        self.inserted_relations = 0
+
+    def insert_file(self, **kwargs):
+        return 1
+
+    def insert_chunks_batch(self, file_id, chunks):
+        self.inserted_chunks.extend(chunks)
+        return list(range(1, len(chunks) + 1))
+
+    def insert_relation(self, **kwargs):
+        self.inserted_relations += 1
+
+
+class DummyParser:
+    def _detect_language(self, file_path):
+        return "python"
+
+    def parse_file(self, file_path, language):
+        return None
+
+
+class DummyChunker:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def chunk_file(self, file_path, tree, language, source_code):
+        return self.chunks
+
+
+class DummyGraphAnalyzer:
+    def __init__(self):
+        self.received_chunk_ids = []
+
+    def analyze_imports(self, chunks, chunk_ids):
+        self.received_chunk_ids.append(list(chunk_ids))
+        return []
+
+    def analyze_calls(self, chunks, chunk_ids):
+        self.received_chunk_ids.append(list(chunk_ids))
+        return []
+
+    def analyze_inheritance(self, chunks, chunk_ids):
+        self.received_chunk_ids.append(list(chunk_ids))
+        return []
+
+
+def test_index_file_batches_embeddings_and_inserts(tmp_path):
+    """index_file should batch embeddings and chunk inserts."""
+
+    file_path = tmp_path / "module.py"
+    file_path.write_text("def a():\n    pass\n\nclass B:\n    pass")
+
+    chunks = [
+        CodeChunk(
+            content="def a():\n    pass",
+            file_path=str(file_path),
+            start_line=1,
+            end_line=2,
+            start_byte=0,
+            end_byte=15,
+            chunk_type="function_definition",
+            language="python",
+            metadata={},
+        ),
+        CodeChunk(
+            content="class B:\n    pass",
+            file_path=str(file_path),
+            start_line=3,
+            end_line=4,
+            start_byte=16,
+            end_byte=31,
+            chunk_type="class_definition",
+            language="python",
+            metadata={},
+        ),
+    ]
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = DummyBatchDb()
+    engine.embedder = DummyBatchEmbedder()
+    engine.parser = DummyParser()
+    engine.chunker = DummyChunker(chunks)
+    engine.graph_analyzer = DummyGraphAnalyzer()
+
+    engine.index_file(repository_id=1, file_path=file_path, repo_path=tmp_path)
+
+    assert engine.embedder.calls == 1
+    assert len(engine.db.inserted_chunks) == 2
+    assert all(len(ids) == 2 for ids in engine.graph_analyzer.received_chunk_ids)

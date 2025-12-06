@@ -1,7 +1,8 @@
 """Database schema and connection management."""
 
 import logging
-from typing import Optional, List, Dict, Any
+from difflib import SequenceMatcher
+from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
 import numpy as np
 
@@ -81,6 +82,8 @@ class Database:
                         language TEXT,
                         size_bytes INTEGER,
                         fingerprint TEXT,
+                        content_hash TEXT,
+                        modified_at TIMESTAMP,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(repository_id, path)
@@ -192,21 +195,24 @@ class Database:
         language: str,
         size_bytes: int,
         fingerprint: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        modified_at: Optional[datetime] = None,
     ) -> int:
         """Insert a file record."""
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO files (repository_id, path, language, size_bytes, fingerprint)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO files (repository_id, path, language, size_bytes, content_hash, modified_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (repository_id, path) DO UPDATE SET
                     language = EXCLUDED.language,
                     size_bytes = EXCLUDED.size_bytes,
-                    fingerprint = COALESCE(EXCLUDED.fingerprint, files.fingerprint),
+                    content_hash = COALESCE(EXCLUDED.content_hash, files.content_hash),
+                    modified_at = COALESCE(EXCLUDED.modified_at, files.modified_at),
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id;
                 """,
-                (repository_id, path, language, size_bytes, fingerprint),
+                (repository_id, path, language, size_bytes, content_hash, modified_at),
             )
             file_id = cur.fetchone()[0]
             self.conn.commit()
@@ -256,6 +262,37 @@ class Database:
             )
             row = cur.fetchone()
             return row[0] if row else None
+    def get_files_for_repository(self, repository_id: int) -> Dict[str, Dict[str, Any]]:
+        """Fetch file metadata for a repository keyed by relative path."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, path, content_hash, modified_at
+                FROM files
+                WHERE repository_id = %s;
+                """,
+                (repository_id,),
+            )
+
+            files: Dict[str, Dict[str, Any]] = {}
+            for row in cur.fetchall():
+                files[row[1]] = {"id": row[0], "content_hash": row[2], "modified_at": row[3]}
+            return files
+
+    def delete_files(self, repository_id: int, paths: List[str]) -> None:
+        """Delete files (and cascading chunks/relations) by path list."""
+        if not paths:
+            return
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM files
+                WHERE repository_id = %s AND path = ANY(%s);
+                """,
+                (repository_id, paths),
+            )
+            self.conn.commit()
 
     def insert_chunk(
         self,
@@ -354,6 +391,41 @@ class Database:
                     }
                 )
             return relations
+    def insert_chunks_batch(self, file_id: int, chunks: List[Dict[str, Any]]) -> List[int]:
+        """Insert multiple chunk records in a single statement."""
+        if not chunks:
+            return []
+
+        with self.conn.cursor() as cur:
+            query = """
+                INSERT INTO chunks (
+                    file_id, content, start_line, end_line, start_byte, end_byte,
+                    chunk_type, language, metadata, embedding
+                ) VALUES %s
+                RETURNING id;
+            """
+
+            template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            data = [
+                (
+                    file_id,
+                    c["content"],
+                    c["start_line"],
+                    c["end_line"],
+                    c["start_byte"],
+                    c["end_byte"],
+                    c["chunk_type"],
+                    c["language"],
+                    psycopg2.extras.Json(c.get("metadata", {})),
+                    c["embedding"].tolist(),
+                )
+                for c in chunks
+            ]
+
+            result = execute_values(cur, query, data, template=template, fetch=True)
+            chunk_ids = [row[0] for row in (result or [])]
+            self.conn.commit()
+            return chunk_ids
 
     def search_chunks(
         self,
@@ -366,6 +438,14 @@ class Database:
         use_lexical: bool = False,
         lexical_weight: float = 0.3,
         query_text: Optional[str] = None,
+        reranker: Optional[Callable[[List[Dict[str, Any]], str], List[float]]] = None,
+        rerank_weight: float = 0.4,
+        rerank_top_k: Optional[int] = None,
+        deduplicate: bool = True,
+        dedup_threshold: float = 0.97,
+        boost_top_level: float = 0.05,
+        boost_recent_edit: float = 0.05,
+        filter_match_boost: float = 0.02,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar chunks using vector similarity with optional lexical/BM25 blending.
@@ -380,6 +460,14 @@ class Database:
             use_lexical: Whether to add lexical/BM25-style scoring
             lexical_weight: Weight for lexical score when blending with vector similarity
             query_text: Raw query text used for lexical scoring
+            reranker: Optional callable that returns cross-encoder scores for results
+            rerank_weight: Blend factor for reranker scores vs. base combined score
+            rerank_top_k: Number of top results to send to reranker (defaults to all)
+            deduplicate: Drop near-identical snippets after scoring
+            dedup_threshold: Similarity threshold (0-1) for deduplication
+            boost_top_level: Bonus for top-level definitions (depth=0)
+            boost_recent_edit: Bonus for recently edited chunks (metadata flag)
+            filter_match_boost: Bonus for chunks that match language/repo filters
 
         Returns:
             List of matching chunks with metadata
@@ -395,6 +483,7 @@ class Database:
         # Clamp lexical weight to [0, 1]
         lexical_weight = max(0.0, min(1.0, lexical_weight))
         vector_weight = 1.0 - lexical_weight
+        rerank_weight = max(0.0, min(1.0, rerank_weight))
 
         with self.conn.cursor() as cur:
             conditions: List[str] = []
@@ -479,7 +568,58 @@ class Database:
                 lexical_score = result.get("lexical_score") or 0.0
                 result["combined_score"] = vector_weight * result["similarity"] + lexical_weight * lexical_score
 
+                # Boost top-level definitions or recent edits if signaled in metadata
+                metadata = result.get("metadata") or {}
+                depth = metadata.get("depth")
+                if boost_top_level and depth == 0:
+                    result["combined_score"] += boost_top_level
+                    result["boost_reason"] = "top_level"
+
+                if boost_recent_edit and metadata.get("recent_edit"):
+                    result["combined_score"] += boost_recent_edit
+                    result["boost_reason"] = metadata.get("boost_reason", "recent_edit")
+
+                if filter_match_boost:
+                    if languages and result.get("language") in languages:
+                        result["combined_score"] += filter_match_boost
+                    # Prefer chunks whose metadata knows the repository id
+                    if repo_filters and metadata.get("repository_id") in repo_filters:
+                        result["combined_score"] += filter_match_boost
+
             results.sort(key=lambda r: r["combined_score"], reverse=True)
+
+            # Optional cross-encoder reranking on the top-k candidates
+            if reranker and query_text and results:
+                rerank_k = rerank_top_k or len(results)
+                candidates = results[:rerank_k]
+                try:
+                    rerank_scores = reranker(candidates, query_text)
+                    if len(rerank_scores) == len(candidates):
+                        for candidate, score in zip(candidates, rerank_scores):
+                            candidate["rerank_score"] = float(score)
+                            candidate["combined_score"] = (
+                                (1 - rerank_weight) * candidate["combined_score"]
+                                + rerank_weight * float(score)
+                            )
+                        results.sort(key=lambda r: r["combined_score"], reverse=True)
+                except Exception as exc:  # pragma: no cover - defensive path
+                    logger.debug(f"Reranker failed, falling back to base ordering: {exc}")
+
+            # Deduplicate near-identical snippets to reduce noise
+            if deduplicate:
+                deduped: List[Dict[str, Any]] = []
+                for result in results:
+                    is_duplicate = False
+                    for kept in deduped:
+                        ratio = SequenceMatcher(None, kept["content"], result["content"]).ratio()
+                        if ratio >= dedup_threshold:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        deduped.append(result)
+                results = deduped
+
+            results = results[:limit]
 
             return results
 
