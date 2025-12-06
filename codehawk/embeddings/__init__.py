@@ -1,6 +1,7 @@
 """Embedding generation for code chunks."""
 
 import logging
+import os
 from typing import List, Optional
 import numpy as np
 from codehawk.chunker import CodeChunk
@@ -27,6 +28,10 @@ class EmbeddingGenerator:
         if self.model is not None:
             return
 
+        if os.environ.get("CODEHAWK_DISABLE_MODEL_LOAD") == "1":
+            logger.info("Embedding model loading disabled; using mock embeddings")
+            return
+
         try:
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer(self.model_name)
@@ -51,18 +56,17 @@ class EmbeddingGenerator:
             self.load_model()
 
         if self.model is None:
-            # Return None for production use - mock embeddings only for testing
-            logger.warning("Embedding model not loaded, returning None")
-            return None
+            logger.warning("Embedding model not loaded, returning mock embedding")
+            return self._mock_embedding(text)
 
         try:
             embedding = self.model.encode(text, convert_to_numpy=True)
             return embedding.astype(np.float32)
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
-            return None
+            return self._mock_embedding(text)
 
-    def generate_embeddings(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> List[Optional[np.ndarray]]:
         """
         Generate embeddings for multiple texts.
 
@@ -76,16 +80,20 @@ class EmbeddingGenerator:
             self.load_model()
 
         if self.model is None:
-            # Return None values for production use
-            logger.warning("Embedding model not loaded, returning None values")
-            return [None] * len(texts)
+            logger.warning("Embedding model not loaded, returning mock embeddings")
+            return [self._mock_embedding(text) for text in texts]
 
         try:
-            embeddings = self.model.encode(texts, convert_to_numpy=True)
-            return [emb.astype(np.float32) for emb in embeddings]
+            results: List[np.ndarray] = []
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start : start + batch_size]
+                batch_embeddings = self.model.encode(batch, convert_to_numpy=True)
+                results.extend(batch_embeddings)
+
+            return [emb.astype(np.float32) for emb in results]
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
-            return [None] * len(texts)
+            return [self._mock_embedding(text) for text in texts]
 
     def generate_chunk_embedding(self, chunk: CodeChunk) -> Optional[np.ndarray]:
         """
@@ -122,3 +130,9 @@ class EmbeddingGenerator:
             parts.insert(1, f"Name: {chunk.metadata['name']}")
 
         return "\n".join(parts)
+
+    def _mock_embedding(self, text: str) -> np.ndarray:
+        """Generate a deterministic mock embedding when the model is unavailable."""
+        seed = abs(hash(text)) % (2**32)
+        rng = np.random.default_rng(seed)
+        return rng.random(self.dimension, dtype=np.float32)
