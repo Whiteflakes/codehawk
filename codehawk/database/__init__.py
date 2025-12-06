@@ -354,3 +354,76 @@ class Database:
             relation_id = cur.fetchone()[0]
             self.conn.commit()
             return relation_id
+
+    def get_relations_for_chunks(self, chunk_ids: List[int]) -> List[Dict[str, Any]]:
+        """Fetch relations where either endpoint matches the provided chunk IDs."""
+
+        if not chunk_ids:
+            return []
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_chunk_id, target_chunk_id, relation_type, metadata
+                FROM relations
+                WHERE source_chunk_id = ANY(%s) OR target_chunk_id = ANY(%s);
+                """,
+                (chunk_ids, chunk_ids),
+            )
+
+            relations = []
+            for row in cur.fetchall():
+                relations.append(
+                    {
+                        "source_chunk_id": row[0],
+                        "target_chunk_id": row[1],
+                        "relation_type": row[2],
+                        "metadata": row[3] or {},
+                    }
+                )
+
+            return relations
+
+    def get_lineage_for_chunks(self, chunk_ids: List[int]) -> List[Dict[str, Any]]:
+        """Fetch commit lineage entries for the files associated with chunk IDs."""
+
+        if not chunk_ids:
+            return []
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.id AS chunk_id,
+                    f.path AS file_path,
+                    co.commit_hash,
+                    co.author,
+                    co.message,
+                    co.timestamp,
+                    fc.change_type
+                FROM chunks c
+                JOIN files f ON c.file_id = f.id
+                JOIN file_commits fc ON f.id = fc.file_id
+                JOIN commits co ON fc.commit_id = co.id
+                WHERE c.id = ANY(%s)
+                ORDER BY co.timestamp DESC;
+                """,
+                (chunk_ids,),
+            )
+
+            lineage = []
+            for row in cur.fetchall():
+                timestamp = row[5]
+                lineage.append(
+                    {
+                        "chunk_id": row[0],
+                        "file_path": row[1],
+                        "commit_hash": row[2],
+                        "author": row[3],
+                        "message": row[4],
+                        "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else timestamp,
+                        "change_type": row[6],
+                    }
+                )
+
+            return lineage
