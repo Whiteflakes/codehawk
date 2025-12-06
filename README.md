@@ -23,6 +23,15 @@ Open-source code context engine using tree-sitter parsing, chunk-level embedding
 - Go (`.go`)
 - Rust (`.rs`)
 
+To enable parsing for each language, install the corresponding tree-sitter grammar packages:
+
+- `tree_sitter_python`
+- `tree_sitter_javascript`
+- `tree_sitter_typescript`
+- `tree_sitter_java`
+- `tree_sitter_go`
+- `tree_sitter_rust`
+
 ## Installation
 
 ### Using pip
