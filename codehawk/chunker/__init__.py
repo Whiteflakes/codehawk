@@ -157,6 +157,21 @@ class CodeChunker:
                 "method_definition",
                 "arrow_function",
             ],
+            "java": [
+                "method_declaration",
+                "constructor_declaration",
+                "class_declaration",
+            ],
+            "go": [
+                "function_declaration",
+                "method_declaration",
+            ],
+            "rust": [
+                "function_item",
+                "impl_item",
+                "trait_item",
+                "struct_item",
+            ],
         }
 
         return node.type in chunkable_types.get(language, [])
@@ -215,9 +230,7 @@ class CodeChunker:
             chunks.append(chunk)
 
             # Move to next chunk with overlap
-            start_idx = end_idx - overlap_lines
-            if start_idx >= len(lines) - overlap_lines:
-                break
+            start_idx = start_idx + max(1, lines_per_chunk - overlap_lines)
             chunk_id += 1
 
         return chunks
