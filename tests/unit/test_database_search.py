@@ -100,3 +100,104 @@ def test_hybrid_search_improves_mrr_and_stays_fast():
     assert hybrid_mrr > vector_mrr
     # Hybrid path should remain within 2x the vector-only latency for small result sets
     assert hybrid_latency <= vector_latency * 2 + 0.001
+
+
+def test_reranker_and_deduplication_boost_mrr_without_huge_latency():
+    rows = [
+        (
+            1,
+            "def helper():\n    return 1",
+            1,
+            3,
+            "function_definition",
+            "python",
+            {"depth": 1},
+            "helpers.py",
+            "repoA",
+            0.85,
+            0.10,
+        ),
+        (
+            2,
+            "def helper():\n    return 1",
+            10,
+            12,
+            "function_definition",
+            "python",
+            {"depth": 0, "recent_edit": True, "repository_id": 42},
+            "helpers.py",
+            "repoA",
+            0.80,
+            0.05,
+        ),
+        (
+            3,
+            "class Service:\n    pass",
+            20,
+            25,
+            "class_definition",
+            "python",
+            {"depth": 0},
+            "service.py",
+            "repoB",
+            0.40,
+            0.60,
+        ),
+    ]
+
+    db = Database.__new__(Database)
+    db.conn = FakeConnection(rows)
+
+    def fake_reranker(results, query):
+        # Pretend the cross-encoder strongly prefers the recent edit (id=2)
+        scores = []
+        for result in results:
+            if result["id"] == 2:
+                scores.append(0.95)
+            elif result["id"] == 3:
+                scores.append(0.2)
+            else:
+                scores.append(0.1)
+        return scores
+
+    start = time.perf_counter()
+    base_results = db.search_chunks(
+        np.array([0.1, 0.2, 0.3]),
+        limit=3,
+        use_lexical=False,
+        deduplicate=False,
+        boost_top_level=0.0,
+        boost_recent_edit=0.0,
+        filter_match_boost=0.0,
+    )
+    base_latency = time.perf_counter() - start
+
+    start = time.perf_counter()
+    reranked_results = db.search_chunks(
+        np.array([0.1, 0.2, 0.3]),
+        limit=3,
+        use_lexical=True,
+        lexical_weight=0.3,
+        query_text="recent helper",
+        repository_ids=[42],
+        languages=["python"],
+        reranker=fake_reranker,
+        rerank_weight=0.6,
+        rerank_top_k=3,
+        deduplicate=True,
+        dedup_threshold=0.9,
+        boost_top_level=0.1,
+        boost_recent_edit=0.1,
+        filter_match_boost=0.05,
+    )
+    rerank_latency = time.perf_counter() - start
+
+    base_mrr = reciprocal_rank([r["id"] for r in base_results], 2)
+    rerank_mrr = reciprocal_rank([r["id"] for r in reranked_results], 2)
+
+    assert rerank_mrr > base_mrr
+    assert reranked_results[0]["id"] == 2
+    # Deduplication should merge the two helper snippets
+    assert len(reranked_results) == 2
+    # Reranking path should be fast enough for small candidate sets
+    assert rerank_latency <= base_latency * 3 + 0.001

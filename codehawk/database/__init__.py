@@ -1,7 +1,8 @@
 """Database schema and connection management."""
 
 import logging
-from typing import Optional, List, Dict, Any
+from difflib import SequenceMatcher
+from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
 import numpy as np
 
@@ -332,6 +333,14 @@ class Database:
         use_lexical: bool = False,
         lexical_weight: float = 0.3,
         query_text: Optional[str] = None,
+        reranker: Optional[Callable[[List[Dict[str, Any]], str], List[float]]] = None,
+        rerank_weight: float = 0.4,
+        rerank_top_k: Optional[int] = None,
+        deduplicate: bool = True,
+        dedup_threshold: float = 0.97,
+        boost_top_level: float = 0.05,
+        boost_recent_edit: float = 0.05,
+        filter_match_boost: float = 0.02,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar chunks using vector similarity with optional lexical/BM25 blending.
@@ -346,6 +355,14 @@ class Database:
             use_lexical: Whether to add lexical/BM25-style scoring
             lexical_weight: Weight for lexical score when blending with vector similarity
             query_text: Raw query text used for lexical scoring
+            reranker: Optional callable that returns cross-encoder scores for results
+            rerank_weight: Blend factor for reranker scores vs. base combined score
+            rerank_top_k: Number of top results to send to reranker (defaults to all)
+            deduplicate: Drop near-identical snippets after scoring
+            dedup_threshold: Similarity threshold (0-1) for deduplication
+            boost_top_level: Bonus for top-level definitions (depth=0)
+            boost_recent_edit: Bonus for recently edited chunks (metadata flag)
+            filter_match_boost: Bonus for chunks that match language/repo filters
 
         Returns:
             List of matching chunks with metadata
@@ -361,6 +378,7 @@ class Database:
         # Clamp lexical weight to [0, 1]
         lexical_weight = max(0.0, min(1.0, lexical_weight))
         vector_weight = 1.0 - lexical_weight
+        rerank_weight = max(0.0, min(1.0, rerank_weight))
 
         with self.conn.cursor() as cur:
             conditions: List[str] = []
@@ -445,7 +463,58 @@ class Database:
                 lexical_score = result.get("lexical_score") or 0.0
                 result["combined_score"] = vector_weight * result["similarity"] + lexical_weight * lexical_score
 
+                # Boost top-level definitions or recent edits if signaled in metadata
+                metadata = result.get("metadata") or {}
+                depth = metadata.get("depth")
+                if boost_top_level and depth == 0:
+                    result["combined_score"] += boost_top_level
+                    result["boost_reason"] = "top_level"
+
+                if boost_recent_edit and metadata.get("recent_edit"):
+                    result["combined_score"] += boost_recent_edit
+                    result["boost_reason"] = metadata.get("boost_reason", "recent_edit")
+
+                if filter_match_boost:
+                    if languages and result.get("language") in languages:
+                        result["combined_score"] += filter_match_boost
+                    # Prefer chunks whose metadata knows the repository id
+                    if repo_filters and metadata.get("repository_id") in repo_filters:
+                        result["combined_score"] += filter_match_boost
+
             results.sort(key=lambda r: r["combined_score"], reverse=True)
+
+            # Optional cross-encoder reranking on the top-k candidates
+            if reranker and query_text and results:
+                rerank_k = rerank_top_k or len(results)
+                candidates = results[:rerank_k]
+                try:
+                    rerank_scores = reranker(candidates, query_text)
+                    if len(rerank_scores) == len(candidates):
+                        for candidate, score in zip(candidates, rerank_scores):
+                            candidate["rerank_score"] = float(score)
+                            candidate["combined_score"] = (
+                                (1 - rerank_weight) * candidate["combined_score"]
+                                + rerank_weight * float(score)
+                            )
+                        results.sort(key=lambda r: r["combined_score"], reverse=True)
+                except Exception as exc:  # pragma: no cover - defensive path
+                    logger.debug(f"Reranker failed, falling back to base ordering: {exc}")
+
+            # Deduplicate near-identical snippets to reduce noise
+            if deduplicate:
+                deduped: List[Dict[str, Any]] = []
+                for result in results:
+                    is_duplicate = False
+                    for kept in deduped:
+                        ratio = SequenceMatcher(None, kept["content"], result["content"]).ratio()
+                        if ratio >= dedup_threshold:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        deduped.append(result)
+                results = deduped
+
+            results = results[:limit]
 
             return results
 

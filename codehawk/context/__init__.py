@@ -271,6 +271,14 @@ class ContextEngine:
         since: Optional[datetime] = None,
         use_lexical: bool = False,
         lexical_weight: float = 0.3,
+        reranker: Optional[Callable[[List[Dict[str, Any]], str], List[float]]] = None,
+        rerank_weight: float = 0.4,
+        rerank_top_k: Optional[int] = None,
+        deduplicate: bool = True,
+        dedup_threshold: float = 0.97,
+        boost_top_level: float = 0.05,
+        boost_recent_edit: float = 0.05,
+        filter_match_boost: float = 0.02,
     ) -> List[Dict[str, Any]]:
         """
         Search for code chunks similar to query.
@@ -284,6 +292,14 @@ class ContextEngine:
             since: Optional recency cutoff timestamp
             use_lexical: Blend vector search with lexical/BM25 scoring
             lexical_weight: Weight to give lexical scoring when blending
+            reranker: Optional cross-encoder reranker callable
+            rerank_weight: Blend factor for reranker scores
+            rerank_top_k: Number of candidates to send to reranker
+            deduplicate: Drop near-identical snippets
+            dedup_threshold: Similarity threshold for deduplication
+            boost_top_level: Bonus for top-level definitions
+            boost_recent_edit: Bonus for recent edits
+            filter_match_boost: Bonus for repo/language filter matches
 
         Returns:
             List of matching chunks
@@ -307,6 +323,14 @@ class ContextEngine:
             use_lexical=use_lexical,
             lexical_weight=lexical_weight,
             query_text=query,
+            reranker=reranker,
+            rerank_weight=rerank_weight,
+            rerank_top_k=rerank_top_k,
+            deduplicate=deduplicate,
+            dedup_threshold=dedup_threshold,
+            boost_top_level=boost_top_level,
+            boost_recent_edit=boost_recent_edit,
+            filter_match_boost=filter_match_boost,
         )
         return results
 
