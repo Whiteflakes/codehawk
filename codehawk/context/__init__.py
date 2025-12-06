@@ -252,7 +252,19 @@ class ContextEngine:
             "lineage": [],
         }
 
-        # TODO: Add relation and lineage information
+        chunk_ids = [chunk.get("id") for chunk in results if chunk.get("id")]
+
+        if include_relations and self.db:
+            try:
+                context_pack["relations"] = self.db.get_relations_for_chunks(chunk_ids)
+            except Exception as e:
+                logger.debug(f"Error fetching relations for context pack: {e}")
+
+        if include_lineage and self.db:
+            try:
+                context_pack["lineage"] = self.db.get_lineage_for_chunks(chunk_ids)
+            except Exception as e:
+                logger.debug(f"Error fetching lineage for context pack: {e}")
 
         return context_pack
 
