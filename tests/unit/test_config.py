@@ -12,6 +12,7 @@ def test_settings_initialization():
     assert settings.db_port == 5432
     assert settings.db_name == "codehawk"
     assert settings.embedding_dimension == 384
+    assert settings.embedding_offline_mode is False
     assert settings.chunk_size == 512
     assert settings.chunk_overlap == 50
 
