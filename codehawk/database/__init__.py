@@ -81,6 +81,8 @@ class Database:
                         path TEXT NOT NULL,
                         language TEXT,
                         size_bytes INTEGER,
+                        content_hash TEXT,
+                        modified_at TIMESTAMP,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(repository_id, path)
@@ -182,24 +184,66 @@ class Database:
             self.conn.commit()
             return repo_id
 
-    def insert_file(self, repository_id: int, path: str, language: str, size_bytes: int) -> int:
+    def insert_file(
+        self,
+        repository_id: int,
+        path: str,
+        language: str,
+        size_bytes: int,
+        content_hash: Optional[str] = None,
+        modified_at: Optional[datetime] = None,
+    ) -> int:
         """Insert a file record."""
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO files (repository_id, path, language, size_bytes)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO files (repository_id, path, language, size_bytes, content_hash, modified_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (repository_id, path) DO UPDATE SET
                     language = EXCLUDED.language,
                     size_bytes = EXCLUDED.size_bytes,
+                    content_hash = COALESCE(EXCLUDED.content_hash, files.content_hash),
+                    modified_at = COALESCE(EXCLUDED.modified_at, files.modified_at),
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id;
                 """,
-                (repository_id, path, language, size_bytes),
+                (repository_id, path, language, size_bytes, content_hash, modified_at),
             )
             file_id = cur.fetchone()[0]
             self.conn.commit()
             return file_id
+
+    def get_files_for_repository(self, repository_id: int) -> Dict[str, Dict[str, Any]]:
+        """Fetch file metadata for a repository keyed by relative path."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, path, content_hash, modified_at
+                FROM files
+                WHERE repository_id = %s;
+                """,
+                (repository_id,),
+            )
+
+            files: Dict[str, Dict[str, Any]] = {}
+            for row in cur.fetchall():
+                files[row[1]] = {"id": row[0], "content_hash": row[2], "modified_at": row[3]}
+            return files
+
+    def delete_files(self, repository_id: int, paths: List[str]) -> None:
+        """Delete files (and cascading chunks/relations) by path list."""
+        if not paths:
+            return
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM files
+                WHERE repository_id = %s AND path = ANY(%s);
+                """,
+                (repository_id, paths),
+            )
+            self.conn.commit()
 
     def insert_chunk(
         self,
@@ -241,6 +285,42 @@ class Database:
             chunk_id = cur.fetchone()[0]
             self.conn.commit()
             return chunk_id
+
+    def insert_chunks_batch(self, file_id: int, chunks: List[Dict[str, Any]]) -> List[int]:
+        """Insert multiple chunk records in a single statement."""
+        if not chunks:
+            return []
+
+        with self.conn.cursor() as cur:
+            query = """
+                INSERT INTO chunks (
+                    file_id, content, start_line, end_line, start_byte, end_byte,
+                    chunk_type, language, metadata, embedding
+                ) VALUES %s
+                RETURNING id;
+            """
+
+            template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            data = [
+                (
+                    file_id,
+                    c["content"],
+                    c["start_line"],
+                    c["end_line"],
+                    c["start_byte"],
+                    c["end_byte"],
+                    c["chunk_type"],
+                    c["language"],
+                    psycopg2.extras.Json(c.get("metadata", {})),
+                    c["embedding"].tolist(),
+                )
+                for c in chunks
+            ]
+
+            result = execute_values(cur, query, data, template=template, fetch=True)
+            chunk_ids = [row[0] for row in (result or [])]
+            self.conn.commit()
+            return chunk_ids
 
     def search_chunks(
         self,
