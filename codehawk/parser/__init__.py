@@ -1,5 +1,6 @@
 """Tree-sitter parser for code analysis."""
 
+import importlib
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -11,6 +12,17 @@ logger = logging.getLogger(__name__)
 class TreeSitterParser:
     """Parser using tree-sitter for multi-language code analysis."""
 
+    EXTENSION_LANGUAGE_MAP = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".java": "java",
+        ".go": "go",
+        ".rs": "rust",
+    }
+
     def __init__(self):
         """Initialize the tree-sitter parser."""
         self.parsers: Dict[str, tree_sitter.Parser] = {}
@@ -21,29 +33,23 @@ class TreeSitterParser:
         """Initialize tree-sitter languages."""
         # Note: In production, you would build language binaries
         # For now, we'll handle gracefully if languages aren't available
-        try:
-            import tree_sitter_python as tspython
-            self.languages["python"] = tree_sitter.Language(tspython.language())
-            parser = tree_sitter.Parser(self.languages["python"])
-            self.parsers["python"] = parser
-        except ImportError:
-            logger.warning("tree-sitter-python not available")
+        language_modules = [
+            ("python", "tree_sitter_python", "tree-sitter-python"),
+            ("javascript", "tree_sitter_javascript", "tree-sitter-javascript"),
+            ("typescript", "tree_sitter_typescript", "tree-sitter-typescript"),
+            ("java", "tree_sitter_java", "tree-sitter-java"),
+            ("go", "tree_sitter_go", "tree-sitter-go"),
+            ("rust", "tree_sitter_rust", "tree-sitter-rust"),
+        ]
 
-        try:
-            import tree_sitter_javascript as tsjavascript
-            self.languages["javascript"] = tree_sitter.Language(tsjavascript.language())
-            parser = tree_sitter.Parser(self.languages["javascript"])
-            self.parsers["javascript"] = parser
-        except ImportError:
-            logger.warning("tree-sitter-javascript not available")
-
-        try:
-            import tree_sitter_typescript as tstypescript
-            self.languages["typescript"] = tree_sitter.Language(tstypescript.language())
-            parser = tree_sitter.Parser(self.languages["typescript"])
-            self.parsers["typescript"] = parser
-        except ImportError:
-            logger.warning("tree-sitter-typescript not available")
+        for language, module_name, package_name in language_modules:
+            try:
+                module = importlib.import_module(module_name)
+                self.languages[language] = tree_sitter.Language(module.language())
+                parser = tree_sitter.Parser(self.languages[language])
+                self.parsers[language] = parser
+            except (ImportError, AttributeError):
+                logger.warning("%s not available", package_name)
 
     def parse_file(self, file_path: Path, language: Optional[str] = None) -> Optional[tree_sitter.Tree]:
         """
@@ -102,17 +108,7 @@ class TreeSitterParser:
         Returns:
             Detected language
         """
-        extension_map = {
-            ".py": "python",
-            ".js": "javascript",
-            ".jsx": "javascript",
-            ".ts": "typescript",
-            ".tsx": "typescript",
-            ".java": "java",
-            ".go": "go",
-            ".rs": "rust",
-        }
-        return extension_map.get(file_path.suffix, "unknown")
+        return self.EXTENSION_LANGUAGE_MAP.get(file_path.suffix, "unknown")
 
     def extract_functions(self, tree: tree_sitter.Tree, language: str) -> List[Dict[str, Any]]:
         """
