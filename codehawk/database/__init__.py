@@ -80,11 +80,15 @@ class Database:
                         path TEXT NOT NULL,
                         language TEXT,
                         size_bytes INTEGER,
+                        fingerprint TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(repository_id, path)
                     );
                 """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_files_fingerprint ON files(repository_id, fingerprint);"
+                )
 
                 # Create chunks table with vector column
                 cur.execute("""
@@ -181,24 +185,77 @@ class Database:
             self.conn.commit()
             return repo_id
 
-    def insert_file(self, repository_id: int, path: str, language: str, size_bytes: int) -> int:
+    def insert_file(
+        self,
+        repository_id: int,
+        path: str,
+        language: str,
+        size_bytes: int,
+        fingerprint: Optional[str] = None,
+    ) -> int:
         """Insert a file record."""
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO files (repository_id, path, language, size_bytes)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO files (repository_id, path, language, size_bytes, fingerprint)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (repository_id, path) DO UPDATE SET
                     language = EXCLUDED.language,
                     size_bytes = EXCLUDED.size_bytes,
+                    fingerprint = COALESCE(EXCLUDED.fingerprint, files.fingerprint),
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id;
                 """,
-                (repository_id, path, language, size_bytes),
+                (repository_id, path, language, size_bytes, fingerprint),
             )
             file_id = cur.fetchone()[0]
             self.conn.commit()
             return file_id
+
+    def update_file_path(self, file_id: int, new_path: str):
+        """Update a file's stored path, preserving history and relations."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE files
+                SET path = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+                """,
+                (new_path, file_id),
+            )
+            self.conn.commit()
+
+    def find_file_by_fingerprint(self, repository_id: int, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """Locate an existing file entry by fingerprint within a repository."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, path
+                FROM files
+                WHERE repository_id = %s AND fingerprint = %s
+                LIMIT 1;
+                """,
+                (repository_id, fingerprint),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {"id": row[0], "path": row[1]}
+
+    def get_file_by_path(self, repository_id: int, path: str) -> Optional[int]:
+        """Fetch a file id by its repository-relative path."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM files
+                WHERE repository_id = %s AND path = %s
+                LIMIT 1;
+                """,
+                (repository_id, path),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def insert_chunk(
         self,
@@ -240,6 +297,63 @@ class Database:
             chunk_id = cur.fetchone()[0]
             self.conn.commit()
             return chunk_id
+
+    def get_chunk_ids_for_file(self, file_id: int) -> List[int]:
+        """Return all chunk ids associated with a file."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM chunks WHERE file_id = %s;
+                """,
+                (file_id,),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def delete_chunks_for_file(self, file_id: int):
+        """Remove chunks for a file, cascading dependent relations via database FKs."""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM chunks WHERE file_id = %s;", (file_id,))
+            self.conn.commit()
+
+    def delete_relations_for_chunks(self, chunk_ids: List[int]):
+        """Delete relations where impacted chunks participate as source or target."""
+        if not chunk_ids:
+            return
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM relations
+                WHERE source_chunk_id = ANY(%s) OR target_chunk_id = ANY(%s);
+                """,
+                (chunk_ids, chunk_ids),
+            )
+            self.conn.commit()
+
+    def get_relations_by_target_ids(self, target_chunk_ids: List[int]) -> List[Dict[str, Any]]:
+        """Fetch relations that point to provided target chunk ids."""
+        if not target_chunk_ids:
+            return []
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_chunk_id, target_chunk_id, relation_type, metadata
+                FROM relations
+                WHERE target_chunk_id = ANY(%s);
+                """,
+                (target_chunk_ids,),
+            )
+            relations: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                relations.append(
+                    {
+                        "source_chunk_id": row[0],
+                        "target_chunk_id": row[1],
+                        "relation_type": row[2],
+                        "metadata": row[3] or {},
+                    }
+                )
+            return relations
 
     def search_chunks(
         self,
@@ -394,6 +508,14 @@ class Database:
             commit_id = cur.fetchone()[0]
             self.conn.commit()
             return commit_id
+
+    def delete_lineage_for_files(self, file_ids: List[int]):
+        """Remove lineage entries for a set of files."""
+        if not file_ids:
+            return
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM file_commits WHERE file_id = ANY(%s);", (file_ids,))
+            self.conn.commit()
 
     def insert_relation(
         self,
