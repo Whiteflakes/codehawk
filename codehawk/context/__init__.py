@@ -11,7 +11,7 @@ from codehawk.parser import TreeSitterParser
 from codehawk.chunker import CodeChunker, CodeChunk
 from codehawk.embeddings import EmbeddingGenerator
 from codehawk.database import Database
-from codehawk.graph import GraphAnalyzer
+from codehawk.graph import GraphAnalyzer, GraphUpdatePlanner
 from codehawk.lineage import LineageTracker
 from codehawk.config import settings
 
@@ -43,6 +43,7 @@ class ContextEngine:
         )
         self.embedder = EmbeddingGenerator(model_name=self.embedding_model)
         self.graph_analyzer = GraphAnalyzer()
+        self.graph_update_planner = GraphUpdatePlanner(self.graph_analyzer)
         
         self.db: Optional[Database] = None
 
@@ -160,6 +161,9 @@ class ContextEngine:
         repository_id: int,
         file_path: Path,
         repo_path: Path,
+        fingerprint: Optional[str] = None,
+        reconcile: bool = False,
+    ) -> Dict[str, Any]:
         source_code: Optional[str] = None,
         content_hash: Optional[str] = None,
         modified_at: Optional[datetime] = None,
@@ -200,15 +204,34 @@ class ContextEngine:
             logger.warning(f"File too large, skipping: {file_path}")
             return
 
-        # Create file record
-        file_id = self.db.insert_file(
+        fingerprint = fingerprint or self._compute_fingerprint(repo_path, file_path, source_code)
+
+        file_id = None
+        if reconcile and fingerprint:
+            existing = self.db.find_file_by_fingerprint(repository_id, fingerprint)
+            if existing:
+                file_id = existing["id"]
+                if existing["path"] != str(relative_path):
+                    self.db.update_file_path(file_id, str(relative_path))
+
+        # Create or update file record
+        file_id = file_id or self.db.insert_file(
             repository_id=repository_id,
             path=str(relative_path),
             language=language,
             size_bytes=len(source_code.encode("utf-8")),
+            fingerprint=fingerprint,
             content_hash=content_hash,
             modified_at=modified_at,
         )
+
+        if reconcile:
+            # Clean stale graph + lineage data before re-inserting
+            existing_chunk_ids = self.db.get_chunk_ids_for_file(file_id)
+            if existing_chunk_ids:
+                self.db.delete_relations_for_chunks(existing_chunk_ids)
+            self.db.delete_lineage_for_files([file_id])
+            self.db.delete_chunks_for_file(file_id)
 
         # Parse file
         tree = self.parser.parse_file(file_path, language)
@@ -260,6 +283,73 @@ class ContextEngine:
                     )
                 except Exception as e:
                     logger.debug(f"Error inserting relation: {e}")
+
+        return {"file_id": file_id, "chunk_ids": chunk_ids}
+
+    def update_changed_files(
+        self,
+        repository_id: int,
+        repo_path: Path,
+        base_commit: str,
+        target_commit: str = "HEAD",
+    ) -> Dict[str, Any]:
+        """Re-index only files touched between two commits with reconciliation."""
+
+        lineage = LineageTracker(repo_path)
+        lineage.open_repository()
+        changes = lineage.detect_changes(base_commit, target_commit)
+
+        changed_chunk_ids: List[int] = []
+        file_ids: List[int] = []
+
+        for change in changes:
+            file_path = repo_path / change.path
+            result = self.index_file(
+                repository_id,
+                file_path,
+                repo_path,
+                fingerprint=change.fingerprint,
+                reconcile=True,
+            )
+            changed_chunk_ids.extend(result.get("chunk_ids", []))
+            if result.get("file_id"):
+                file_ids.append(result["file_id"])
+
+        # Identify ancestors to re-run graph analysis on
+        existing_relations = self.db.get_relations_by_target_ids(changed_chunk_ids)
+        relation_objects = [
+            CodeRelation(
+                source_chunk_id=rel["source_chunk_id"],
+                target_chunk_id=rel["target_chunk_id"],
+                relation_type=rel["relation_type"],
+                metadata=rel.get("metadata", {}),
+            )
+            for rel in existing_relations
+        ]
+
+        impacted_chunk_ids = self.graph_update_planner.impacted_chunks(
+            relation_objects, set(changed_chunk_ids)
+        )
+        if impacted_chunk_ids:
+            self.db.delete_relations_for_chunks(list(impacted_chunk_ids))
+
+        return {
+            "changes": changes,
+            "impacted_chunk_ids": impacted_chunk_ids,
+            "file_ids": file_ids,
+        }
+
+    def _compute_fingerprint(
+        self, repo_path: Path, file_path: Path, content: str
+    ) -> Optional[str]:
+        try:
+            lineage = LineageTracker(repo_path)
+            lineage.open_repository()
+            return lineage.get_blob_fingerprint(file_path)
+        except Exception:
+            import hashlib
+
+            return hashlib.sha1(content.encode("utf-8")).hexdigest()
 
     def search(
         self,

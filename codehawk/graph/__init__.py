@@ -60,6 +60,30 @@ class GraphAnalyzer:
 
         return relations
 
+
+class GraphUpdatePlanner:
+    """Determines which chunks need to be re-analyzed after file changes."""
+
+    def __init__(self, analyzer: "GraphAnalyzer"):
+        self.analyzer = analyzer
+
+    def impacted_chunks(
+        self, relations: List[CodeRelation], changed_chunk_ids: Set[int]
+    ) -> Set[int]:
+        """Return changed chunks plus their ancestors in the relation graph."""
+
+        impacted: Set[int] = set(changed_chunk_ids)
+        added = True
+
+        while added:
+            added = False
+            for relation in relations:
+                if relation.target_chunk_id in impacted and relation.source_chunk_id not in impacted:
+                    impacted.add(relation.source_chunk_id)
+                    added = True
+
+        return impacted
+
     def analyze_calls(self, chunks: List[CodeChunk], chunk_ids: List[int]) -> List[CodeRelation]:
         """
         Analyze function call relationships.
