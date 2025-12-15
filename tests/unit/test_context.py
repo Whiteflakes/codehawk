@@ -82,12 +82,17 @@ class DummyIndexDatabase:
         self.existing_files = existing_files
         self.deleted = []
         self.files_inserted = []
+        self.overview_called = False
 
     def get_files_for_repository(self, repository_id):
         return self.existing_files
 
     def delete_files(self, repository_id, paths):
         self.deleted.extend(paths)
+
+    def get_repository_skeletons(self, repository_id):
+        self.overview_called = True
+        return [{"file_path": "app.py", "skeleton": "def main(): ..."}]
 
 
 def test_index_directory_skips_unchanged(tmp_path, monkeypatch):
@@ -114,6 +119,16 @@ def test_index_directory_skips_unchanged(tmp_path, monkeypatch):
 
     assert calls["indexed"] == 0
     assert engine.db.deleted == []
+
+
+def test_repository_overview_uses_skeletons():
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = DummyIndexDatabase(existing_files={})
+
+    overview = engine.get_repository_overview(1)
+
+    assert engine.db.overview_called
+    assert overview[0]["file_path"] == "app.py"
 
 
 class DummyBatchEmbedder:
