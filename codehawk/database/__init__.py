@@ -657,6 +657,27 @@ class Database:
             cur.execute("DELETE FROM file_commits WHERE file_id = ANY(%s);", (file_ids,))
             self.conn.commit()
 
+    def link_file_commit(
+        self, file_id: int, commit_id: int, change_type: str = "modified"
+    ) -> int:
+        """Insert or update a file-to-commit lineage entry."""
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO file_commits (file_id, commit_id, change_type)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (file_id, commit_id) DO UPDATE SET
+                    change_type = EXCLUDED.change_type
+                RETURNING id;
+                """,
+                (file_id, commit_id, change_type),
+            )
+
+            file_commit_id = cur.fetchone()[0]
+            self.conn.commit()
+            return file_commit_id
+
     def insert_relation(
         self,
         source_chunk_id: int,
