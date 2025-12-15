@@ -6,6 +6,8 @@ from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
 import numpy as np
 
+from codehawk.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Optional dependency - fail gracefully if not available
@@ -58,6 +60,8 @@ class Database:
 
         try:
             with self.conn.cursor() as cur:
+                embedding_dimension = getattr(settings, "embedding_dimension", 384) or 384
+
                 # Enable pgvector extension
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
@@ -94,7 +98,8 @@ class Database:
                 )
 
                 # Create chunks table with vector column
-                cur.execute("""
+                cur.execute(
+                    f"""
                     CREATE TABLE IF NOT EXISTS chunks (
                         id SERIAL PRIMARY KEY,
                         file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
@@ -106,10 +111,11 @@ class Database:
                         chunk_type TEXT,
                         language TEXT,
                         metadata JSONB,
-                        embedding vector(384),
+                        embedding vector({embedding_dimension}),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                """)
+                    """
+                )
 
                 # Create commits table
                 cur.execute("""

@@ -266,6 +266,8 @@ class ContextEngine:
 
         chunk_ids = self.db.insert_chunks_batch(file_id=file_id, chunks=chunk_records)
 
+        self._record_file_lineage(repo_path, file_path, repository_id, file_id)
+
         # Analyze relationships
         if chunk_ids:
             relations = self.graph_analyzer.analyze_imports(filtered_chunks, chunk_ids)
@@ -337,6 +339,57 @@ class ContextEngine:
             "impacted_chunk_ids": impacted_chunk_ids,
             "file_ids": file_ids,
         }
+
+    def _record_file_lineage(
+        self, repo_path: Path, file_path: Path, repository_id: int, file_id: int
+    ) -> None:
+        """Link the current file contents to the latest commit when git metadata is available."""
+
+        if not self.db or not hasattr(self.db, "insert_commit"):
+            return
+
+        try:
+            commit_info = self._resolve_file_commit(repo_path, file_path)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.debug(f"Unable to resolve commit for {file_path}: {exc}")
+            return
+
+        if not commit_info:
+            return
+
+        try:
+            commit_id = self.db.insert_commit(
+                repository_id=repository_id,
+                commit_hash=commit_info["hash"],
+                author=commit_info.get("author", ""),
+                message=commit_info.get("message", ""),
+                timestamp=commit_info.get("timestamp"),
+            )
+            self.db.link_file_commit(
+                file_id=file_id,
+                commit_id=commit_id,
+                change_type=commit_info.get("change_type", "modified"),
+            )
+        except Exception as exc:  # pragma: no cover - best-effort lineage capture
+            logger.debug(f"Unable to link commit for {file_path}: {exc}")
+
+    def _resolve_file_commit(
+        self, repo_path: Path, file_path: Path
+    ) -> Optional[Dict[str, Any]]:
+        """Return latest commit info for a file, safely handling non-git repos."""
+
+        git_dir = repo_path / ".git"
+        if not git_dir.exists() or not git_dir.is_dir():
+            return None
+
+        try:
+            lineage = LineageTracker(repo_path)
+            lineage.open_repository()
+            commits = lineage.get_file_commits(file_path, limit=1)
+            return commits[0] if commits else None
+        except Exception as exc:  # pragma: no cover - depends on git availability
+            logger.debug(f"Skipping lineage linking for {file_path}: {exc}")
+            return None
 
     def _compute_fingerprint(
         self, repo_path: Path, file_path: Path, content: str
