@@ -171,6 +171,29 @@ async def process_mcp_request(request: MCPRequest) -> MCPResponse:
                 id=request.id,
             )
 
+        elif request.method == "read_file_skeleton":
+            path = request.params.get("path")
+            repository_id = request.params.get("repository_id")
+            if not path or repository_id is None:
+                return MCPResponse(
+                    error={"code": -32602, "message": "path and repository_id are required"},
+                    id=request.id,
+                )
+
+            skeletons = engine.get_repository_overview(repository_id)
+            skeleton_text = next((item["skeleton"] for item in skeletons if item["file_path"] == path), "")
+            return MCPResponse(result={"path": path, "skeleton": skeleton_text}, id=request.id)
+
+        elif request.method == "repository_overview":
+            repository_id = request.params.get("repository_id")
+            if repository_id is None:
+                return MCPResponse(
+                    error={"code": -32602, "message": "repository_id is required"},
+                    id=request.id,
+                )
+            overview = engine.get_repository_overview(repository_id)
+            return MCPResponse(result={"overview": overview}, id=request.id)
+
         elif request.method == "index_repository":
             # Index a repository
             repo_path = Path(request.params.get("repository_path", ""))
@@ -206,6 +229,16 @@ async def process_mcp_request(request: MCPRequest) -> MCPResponse:
                     "name": "index_repository",
                     "description": "Index a repository",
                     "params": ["repository_path", "repository_url"],
+                },
+                {
+                    "name": "read_file_skeleton",
+                    "description": "Retrieve a skeletonized view of a file",
+                    "params": ["path", "repository_id"],
+                },
+                {
+                    "name": "repository_overview",
+                    "description": "Get a passive skeleton overview of an indexed repository",
+                    "params": ["repository_id"],
                 },
                 {
                     "name": "list_methods",

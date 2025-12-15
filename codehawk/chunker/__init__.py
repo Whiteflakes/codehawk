@@ -50,6 +50,7 @@ class CodeChunk:
     chunk_type: str  # 'function', 'class', 'block', 'file'
     language: str
     metadata: Dict[str, Any]
+    skeleton: str = ""
 
 
 class CodeChunker:
@@ -129,6 +130,7 @@ class CodeChunker:
                 start_byte = node.start_byte
                 end_byte = node.end_byte
                 content = source_bytes[start_byte:end_byte].decode("utf-8")
+                skeleton = self._build_skeleton(content, language)
 
                 # Only chunk if size is reasonable
                 if len(content) <= self.chunk_size * 2:
@@ -148,6 +150,7 @@ class CodeChunker:
                             "node_type": node.type,
                             "depth": depth,
                         },
+                        skeleton=skeleton,
                     )
                     chunks.append(chunk)
                     return  # Don't traverse children if we chunked this node
@@ -257,6 +260,7 @@ class CodeChunker:
                     "chunk_id": chunk_id,
                     "total_lines": len(lines),
                 },
+                skeleton=self._build_skeleton(content, language),
             )
             chunks.append(chunk)
 
@@ -265,3 +269,68 @@ class CodeChunker:
             chunk_id += 1
 
         return chunks
+
+    def _build_skeleton(self, content: str, language: str) -> str:
+        """Create a lightweight skeleton view for a chunk.
+
+        The skeleton preserves signatures and docstrings while stripping heavy bodies
+        to deliver token-efficient structure for retrieval.
+        """
+        if not content:
+            return ""
+
+        if language == "python":
+            import ast
+
+            try:
+                module = ast.parse(content)
+            except SyntaxError:
+                # Fall back to heuristic trimming
+                header = content.split("\n", 1)[0]
+                return header.strip()
+
+            class SkeletonVisitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.lines: List[str] = []
+
+                def visit_FunctionDef(self, node: ast.FunctionDef):
+                    signature = ast.get_source_segment(content, node) or f"def {node.name}(...)"
+                    sig_line = signature.split("\n")[0].strip()
+                    doc = ast.get_docstring(node)
+                    if doc:
+                        self.lines.append(f"{sig_line}\n    \"\"\"{doc}\"\"\"")
+                    else:
+                        self.lines.append(sig_line)
+
+                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+                    signature = ast.get_source_segment(content, node) or f"async def {node.name}(...)"
+                    sig_line = signature.split("\n")[0].strip()
+                    doc = ast.get_docstring(node)
+                    if doc:
+                        self.lines.append(f"{sig_line}\n    \"\"\"{doc}\"\"\"")
+                    else:
+                        self.lines.append(sig_line)
+
+                def visit_ClassDef(self, node: ast.ClassDef):
+                    bases = [getattr(base, "id", getattr(base, "attr", "")) for base in node.bases]
+                    base_sig = f"({', '.join(b for b in bases if b)})" if bases else ""
+                    header = f"class {node.name}{base_sig}:"
+                    doc = ast.get_docstring(node)
+                    if doc:
+                        self.lines.append(f"{header}\n    \"\"\"{doc}\"\"\"")
+                    else:
+                        self.lines.append(header)
+                    self.generic_visit(node)
+
+            visitor = SkeletonVisitor()
+            visitor.visit(module)
+            return "\n".join(visitor.lines) or content.split("\n", 1)[0].strip()
+
+        # Generic fallback: keep first line and trim interior
+        lines = [line for line in content.split("\n") if line.strip()]
+        if not lines:
+            return ""
+        first_line = lines[0].strip()
+        if len(lines) == 1:
+            return first_line
+        return first_line + " ..."

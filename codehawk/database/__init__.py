@@ -97,13 +97,14 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_files_fingerprint ON files(repository_id, fingerprint);"
                 )
 
-                # Create chunks table with vector column
+                # Create chunks table with vector column and skeleton content
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS chunks (
                         id SERIAL PRIMARY KEY,
                         file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
                         content TEXT NOT NULL,
+                        skeleton_content TEXT,
                         start_line INTEGER,
                         end_line INTEGER,
                         start_byte INTEGER,
@@ -114,6 +115,21 @@ class Database:
                         embedding vector({embedding_dimension}),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
+                    """,
+                )
+
+                # Backfill skeleton column for existing deployments
+                cur.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'chunks' AND column_name = 'skeleton_content'
+                        ) THEN
+                            ALTER TABLE chunks ADD COLUMN skeleton_content TEXT;
+                        END IF;
+                    END $$;
                     """
                 )
 
@@ -155,6 +171,23 @@ class Database:
                         UNIQUE(source_chunk_id, target_chunk_id, relation_type)
                     );
                 """)
+
+                # Global symbol index for configuration/constants
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS global_symbols (
+                        id SERIAL PRIMARY KEY,
+                        file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+                        chunk_id INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
+                        name TEXT NOT NULL,
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_global_symbols_name ON global_symbols(name);"
+                )
 
                 # Create indexes
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);")
@@ -304,6 +337,7 @@ class Database:
         self,
         file_id: int,
         content: str,
+        skeleton_content: Optional[str],
         start_line: int,
         end_line: int,
         start_byte: int,
@@ -318,15 +352,16 @@ class Database:
             cur.execute(
                 """
                 INSERT INTO chunks (
-                    file_id, content, start_line, end_line, start_byte, end_byte,
+                    file_id, content, skeleton_content, start_line, end_line, start_byte, end_byte,
                     chunk_type, language, metadata, embedding
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
                 (
                     file_id,
                     content,
+                    skeleton_content,
                     start_line,
                     end_line,
                     start_byte,
@@ -405,17 +440,18 @@ class Database:
         with self.conn.cursor() as cur:
             query = """
                 INSERT INTO chunks (
-                    file_id, content, start_line, end_line, start_byte, end_byte,
+                    file_id, content, skeleton_content, start_line, end_line, start_byte, end_byte,
                     chunk_type, language, metadata, embedding
                 ) VALUES %s
                 RETURNING id;
             """
 
-            template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             data = [
                 (
                     file_id,
                     c["content"],
+                    c.get("skeleton_content"),
                     c["start_line"],
                     c["end_line"],
                     c["start_byte"],
@@ -521,7 +557,7 @@ class Database:
                 where_clause = "WHERE " + " AND ".join(conditions)
 
             inner_select = f"""
-                SELECT c.id, c.content, c.start_line, c.end_line, c.chunk_type,
+                SELECT c.id, c.content, c.skeleton_content, c.start_line, c.end_line, c.chunk_type,
                        c.language, c.metadata, f.path, r.name as repository_name,
                        {vector_score_select},
                        {lexical_select}
@@ -553,19 +589,20 @@ class Database:
 
             results = []
             for row in cur.fetchall():
-                lexical_value = None if not use_lexical else (None if row[10] is None else float(row[10]))
+                lexical_value = None if not use_lexical else (None if row[11] is None else float(row[11]))
 
                 results.append({
                     "id": row[0],
                     "content": row[1],
-                    "start_line": row[2],
-                    "end_line": row[3],
-                    "chunk_type": row[4],
-                    "language": row[5],
-                    "metadata": row[6],
-                    "file_path": row[7],
-                    "repository": row[8],
-                    "similarity": float(row[9]),
+                    "skeleton_content": row[2],
+                    "start_line": row[3],
+                    "end_line": row[4],
+                    "chunk_type": row[5],
+                    "language": row[6],
+                    "metadata": row[7],
+                    "file_path": row[8],
+                    "repository": row[9],
+                    "similarity": float(row[10]),
                     "lexical_score": lexical_value,
                 })
 
@@ -626,6 +663,51 @@ class Database:
                 results = deduped
 
             results = results[:limit]
+
+        return results
+
+    def search_global_symbols(self, terms: List[str], repository_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        """Return chunks linked to globals/configs matching query terms."""
+
+        if not terms:
+            return []
+        repo_filters = repository_ids or []
+
+        with self.conn.cursor() as cur:
+            conditions = ["gs.name ILIKE ANY(%s)"]
+            params: List[Any] = [[f"%{t}%" for t in terms]]
+
+            if repo_filters:
+                conditions.append("f.repository_id = ANY(%s)")
+                params.append(repo_filters)
+
+            where_clause = " AND ".join(conditions)
+
+            cur.execute(
+                f"""
+                SELECT gs.name, gs.metadata, c.id, c.content, c.skeleton_content, c.language, f.path
+                FROM global_symbols gs
+                JOIN chunks c ON gs.chunk_id = c.id
+                JOIN files f ON c.file_id = f.id
+                WHERE {where_clause}
+                LIMIT 20;
+                """,
+                params,
+            )
+
+            results: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                results.append(
+                    {
+                        "symbol": row[0],
+                        "metadata": row[1] or {},
+                        "chunk_id": row[2],
+                        "content": row[3],
+                        "skeleton_content": row[4],
+                        "language": row[5],
+                        "file_path": row[6],
+                    }
+                )
 
             return results
 
@@ -707,6 +789,24 @@ class Database:
             self.conn.commit()
             return relation_id
 
+    def insert_global_symbol(
+        self, file_id: int, chunk_id: int, name: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """Index a global/config symbol for retrieval boosts."""
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO global_symbols (file_id, chunk_id, name, metadata)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id;
+                """,
+                (file_id, chunk_id, name, psycopg2.extras.Json(metadata or {})),
+            )
+            symbol_id = cur.fetchone()[0]
+            self.conn.commit()
+            return symbol_id
+
     def get_relations_for_chunks(self, chunk_ids: List[int]) -> List[Dict[str, Any]]:
         """Fetch relations where either endpoint matches the provided chunk IDs."""
 
@@ -735,6 +835,37 @@ class Database:
                 )
 
             return relations
+
+    def get_chunks_by_ids(self, chunk_ids: List[int]) -> List[Dict[str, Any]]:
+        """Return chunk payloads (including skeleton content) for ids."""
+
+        if not chunk_ids:
+            return []
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.content, c.skeleton_content, c.language, c.metadata, f.path
+                FROM chunks c
+                JOIN files f ON c.file_id = f.id
+                WHERE c.id = ANY(%s);
+                """,
+                (chunk_ids,),
+            )
+
+            results: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                results.append(
+                    {
+                        "id": row[0],
+                        "content": row[1],
+                        "skeleton_content": row[2],
+                        "language": row[3],
+                        "metadata": row[4] or {},
+                        "file_path": row[5],
+                    }
+                )
+            return results
 
     def get_lineage_for_chunks(self, chunk_ids: List[int]) -> List[Dict[str, Any]]:
         """Fetch commit lineage entries for the files associated with chunk IDs."""
@@ -779,3 +910,24 @@ class Database:
                 )
 
             return lineage
+
+    def get_repository_skeletons(self, repository_id: int) -> List[Dict[str, Any]]:
+        """Return lightweight skeleton views per file for passive overviews."""
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT f.path, STRING_AGG(c.skeleton_content, '\n' ORDER BY c.start_line)
+                FROM files f
+                JOIN chunks c ON c.file_id = f.id
+                WHERE f.repository_id = %s AND c.skeleton_content IS NOT NULL
+                GROUP BY f.path
+                ORDER BY f.path;
+                """,
+                (repository_id,),
+            )
+
+            return [
+                {"file_path": row[0], "skeleton": row[1] or ""}
+                for row in cur.fetchall()
+            ]

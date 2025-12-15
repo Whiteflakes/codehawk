@@ -155,3 +155,20 @@ def test_chunk_file_falls_back_when_structure_empty():
 
     assert len(chunks) >= 1
     assert all(chunk.chunk_type == "block" for chunk in chunks)
+
+
+def test_skeletonization_trims_function_bodies():
+    """Skeletons should capture signatures/docstrings without full bodies."""
+
+    chunker = CodeChunker()
+    source = """
+def calculate(value: int) -> int:
+    '''Compute doubled value'''
+    result = value * 2
+    return result
+""".strip()
+
+    chunks = chunker._chunk_by_lines(Path("calc.py"), "python", source)
+    skeletons = [c.skeleton for c in chunks]
+    assert any("calculate" in skel for skel in skeletons)
+    assert all("result =" not in skel for skel in skeletons)
