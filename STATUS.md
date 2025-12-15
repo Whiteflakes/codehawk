@@ -1,23 +1,36 @@
-# Context Engine Status and Next Steps
+# Release Notes
 
-## Current strengths
-- **Multi-language parsing is wired up**: Tree-sitter parsers are initialized for Python, JavaScript/TypeScript, Java, Go, and Rust, aligning extensions to grammar modules so non-Python/JS code is handled semantically instead of line-by-line fallbacks.【F:codehawk/parser/__init__.py†L15-L52】
-- **Semantic chunking for all advertised languages**: Function/class-aware chunking detects meaningful nodes across Python, JS/TS, Java, Go, and Rust before falling back to overlapped line blocks, keeping context slices aligned to logical units.【F:codehawk/chunker/__init__.py†L41-L178】
-- **Relation- and lineage-ready context packs**: Context retrieval blends vector search with optional lexical weighting and passes retrieved chunk IDs to relation and lineage lookups so MCP/LLM callers can stitch dependency-aware packs.【F:codehawk/context/__init__.py†L204-L295】【F:codehawk/database/__init__.py†L244-L360】
+These release notes summarize the current state of CodeHawk, highlighting working capabilities, known gaps, and the steps still required for a stable release.
 
-## Gaps and recommended next steps
-1. **Accelerate and harden indexing for large/active repos**
-   - Today each file is re-read, parsed, chunked, and each chunk is embedded and inserted one-by-one with no change detection or batching. Repo walks also rescan every supported extension on each run.【F:codehawk/context/__init__.py†L121-L203】【F:codehawk/context/__init__.py†L297-L321】 
-   - Add file hashing/mtime tracking to skip unchanged files, queue deletions, and stream inserts in batches (both embeddings and DB writes) to minimize round-trips and improve throughput on monorepos.
+## Current capabilities
+- Tree-sitter–backed parsing for Python, JavaScript/TypeScript, Java, Go, and Rust with graceful warnings when grammars are missing.
+- Structure-aware chunking that prefers semantic nodes (functions, classes, methods) and falls back to overlapped line windows when a parse tree is unavailable.
+- Embedding generation through `sentence-transformers` with deterministic offline fallbacks and a pluggable backend hook for custom models.
+- PostgreSQL storage (with pgvector) that tracks repositories, files, chunks, relations, and lineage, plus basic search and context-pack assembly for LLM callers.
+- Incremental-friendly indexing helpers that skip unchanged files via content hashing and remove deleted paths before writing new chunks and relations.
 
-2. **Improve retrieval quality beyond basic vector/lexical blending**
-   - The search path currently blends cosine similarity with optional BM25-style ranking but lacks rerankers, snippet deduplication, or structural boosts (e.g., prefer top-level definitions or recently touched chunks).【F:codehawk/database/__init__.py†L244-L360】 
-   - Introduce lightweight cross-encoder reranking, repository/language priors, and duplication suppression so returned packs are higher-precision and cheaper for LLM consumption.
+## Known issues and limitations
+- Tree-sitter grammars must be installed separately; missing grammars log warnings and disable semantic chunking for that language.
+- Embedding downloads can fail in network-restricted environments; offline mode yields deterministic vectors suitable for testing but not production relevance.
+- Search quality is limited to vector/BM25 blending without rerankers or snippet deduplication, and relation/lineage enrichment depends on a healthy database state.
+- API, MCP, and CLI commands assume a running PostgreSQL with pgvector; there is no bundled container or migration tool, and authentication/authorization are out of scope.
+- Test coverage is minimal and does not exercise the database, API surface, or long-running indexing flows.
 
-3. **Tighten incremental lineage and relation refresh**
-   - Relation and lineage fetches assume database state is already consistent, but indexing does not reconcile moved/renamed files or recompute relations when code changes.【F:codehawk/context/__init__.py†L187-L295】 
-   - Store file commit fingerprints and re-run graph analysis only for touched files/ancestors, ensuring relation graphs stay accurate without full reindexing.
+## Remaining work
+- Package tree-sitter grammars or add setup scripts so semantic parsing works out of the box.
+- Harden embedding configuration: allow explicit local model paths, clearer error surfacing, and better retries before falling back to mock vectors.
+- Improve retrieval quality with rerankers, snippet deduplication, and structural boosts; add evaluation data to guard regressions.
+- Ship operational tooling (schema migrations, health checks, seed data) and validate API/MCP/CLI paths end-to-end against a real database.
+- Expand automated tests to cover database writes, search results, and graph/lineage reconciliation across incremental indexes.
 
-4. **Reduce dependency friction for local runs**
-   - Embedding generation returns `None` when the model is absent or download stalls, which can leave chunks unembedded during offline or air-gapped runs.【F:codehawk/embeddings/__init__.py†L25-L88】 
-   - Ship a small default model checkpoint or allow pluggable local embedding backends (e.g., ggml/onnx) with clear error surfacing so indexing never silently drops chunks.
+## Release readiness checklist
+- [ ] PostgreSQL + pgvector provisioned and reachable using the connection string in `CODEHAWK_DATABASE_URL`.
+- [ ] Required tree-sitter grammars installed for the languages you plan to index.
+- [ ] Embedding model available (or offline fallback explicitly accepted) and sized to `CODEHAWK_EMBEDDING_DIMENSION`.
+- [ ] Initial database schema created via `codehawk init-db` and smoke-tested with a small repository index.
+- [ ] API/MCP/CLI flows validated against your environment, with observability and retries in place for long indexing jobs.
+- [ ] Minimal integration test suite executed (or equivalent manual verification) covering indexing, search, and context-pack generation.
+
+## Authoritative references
+- See the [README](README.md) for installation, configuration, and CLI/API usage examples.
+- Refer to in-code defaults in `codehawk/config.py` and component modules for exact behaviors when settings are omitted.
