@@ -24,6 +24,7 @@ This document is the authoritative release checklist for CodeHawk. It complement
 - [ ] PostgreSQL + pgvector provisioned and reachable using the connection string configured in environment variables (see README for `CODEHAWK_DB_*` settings).
 - [ ] Required tree-sitter grammars installed for each language you plan to index.
 - [ ] Embedding model available (or offline fallback explicitly accepted) and sized to `CODEHAWK_EMBEDDING_DIMENSION`.
+- [ ] Development and test dependencies installed via `pip install -r requirements-dev.txt` (or `uv pip install -r requirements-dev.txt`) before running the automated test suite.
 - [ ] Database schema initialized via `codehawk init-db` and smoke-tested by indexing a small repository through the CLI.
 - [ ] API, MCP, and CLI flows validated end-to-end against your environment (follow the usage examples in the README), with observability and retries in place for long indexing jobs.
 - [ ] Minimal integration verification covering indexing, search, and context-pack generation, either through automated tests or targeted manual checks.
