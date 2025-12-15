@@ -311,7 +311,13 @@ pytest --cov=codehawk --cov-report=html
 
 # Run specific test file
 pytest tests/unit/test_parser.py
+
+# Run end-to-end tests (requires Docker + testcontainers and pgvector image)
+pytest tests/e2e
 ```
+
+End-to-end tests spin up a temporary PostgreSQL with pgvector using `testcontainers`. If Docker or the image is unavailable, the
+suite will be skipped automatically and unit tests can still be run locally or in CI.
 
 ## Contributing
 

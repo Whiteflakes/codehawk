@@ -1,8 +1,11 @@
 """Unit tests for tree-sitter parser."""
 
 import importlib.util
-import pytest
+import importlib
 from pathlib import Path
+
+import pytest
+
 from codehawk.parser import TreeSitterParser
 
 
