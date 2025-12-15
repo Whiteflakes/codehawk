@@ -50,6 +50,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv pip install -e .
 ```
 
+### Development and testing setup
+
+Install the development requirements before running the test suite:
+
+```bash
+# Using pip
+pip install -r requirements-dev.txt
+
+# Using uv
+uv pip install -r requirements-dev.txt
+```
+
 ## Quick Start
 
 ### 1. Setup Database
