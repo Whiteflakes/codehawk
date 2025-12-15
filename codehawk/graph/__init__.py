@@ -60,30 +60,6 @@ class GraphAnalyzer:
 
         return relations
 
-
-class GraphUpdatePlanner:
-    """Determines which chunks need to be re-analyzed after file changes."""
-
-    def __init__(self, analyzer: "GraphAnalyzer"):
-        self.analyzer = analyzer
-
-    def impacted_chunks(
-        self, relations: List[CodeRelation], changed_chunk_ids: Set[int]
-    ) -> Set[int]:
-        """Return changed chunks plus their ancestors in the relation graph."""
-
-        impacted: Set[int] = set(changed_chunk_ids)
-        added = True
-
-        while added:
-            added = False
-            for relation in relations:
-                if relation.target_chunk_id in impacted and relation.source_chunk_id not in impacted:
-                    impacted.add(relation.source_chunk_id)
-                    added = True
-
-        return impacted
-
     def analyze_calls(self, chunks: List[CodeChunk], chunk_ids: List[int]) -> List[CodeRelation]:
         """
         Analyze function call relationships.
@@ -100,7 +76,7 @@ class GraphUpdatePlanner:
         for i, chunk in enumerate(chunks):
             if chunk.chunk_type in ["function_definition", "method_definition"]:
                 calls = self._extract_function_calls(chunk.content, chunk.language)
-                
+
                 for call in calls:
                     # Find chunks that define this function
                     for j, target_chunk in enumerate(chunks):
@@ -136,7 +112,7 @@ class GraphUpdatePlanner:
         for i, chunk in enumerate(chunks):
             if chunk.chunk_type == "class_definition":
                 base_classes = self._extract_base_classes(chunk.content, chunk.language)
-                
+
                 for base_class in base_classes:
                     # Find chunks that define this base class
                     for j, target_chunk in enumerate(chunks):
@@ -159,7 +135,7 @@ class GraphUpdatePlanner:
     def _extract_imports(self, content: str, language: str) -> List[str]:
         """Extract import statements from code."""
         imports = []
-        
+
         if language == "python":
             for line in content.split("\n"):
                 line = line.strip()
@@ -171,7 +147,7 @@ class GraphUpdatePlanner:
                     parts = line.split()
                     if len(parts) >= 2:
                         imports.append(parts[1].split(".")[0])
-        
+
         elif language in ["javascript", "typescript"]:
             for line in content.split("\n"):
                 line = line.strip()
@@ -188,12 +164,12 @@ class GraphUpdatePlanner:
     def _extract_function_calls(self, content: str, language: str) -> List[str]:
         """Extract function calls from code."""
         calls = []
-        
+
         # Simple heuristic - look for patterns like "function_name("
         import re
         pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
         matches = re.finditer(pattern, content)
-        
+
         for match in matches:
             func_name = match.group(1)
             # Filter out common keywords
@@ -205,7 +181,7 @@ class GraphUpdatePlanner:
     def _extract_base_classes(self, content: str, language: str) -> List[str]:
         """Extract base classes from class definition."""
         base_classes = []
-        
+
         if language == "python":
             import re
             pattern = r'class\s+\w+\s*\(([^)]+)\)'
@@ -239,3 +215,27 @@ class GraphUpdatePlanner:
             first_line = chunk.content.split("\n")[0]
             return name in first_line
         return False
+
+
+class GraphUpdatePlanner:
+    """Determines which chunks need to be re-analyzed after file changes."""
+
+    def __init__(self, analyzer: "GraphAnalyzer"):
+        self.analyzer = analyzer
+
+    def impacted_chunks(
+        self, relations: List[CodeRelation], changed_chunk_ids: Set[int]
+    ) -> Set[int]:
+        """Return changed chunks plus their ancestors in the relation graph."""
+
+        impacted: Set[int] = set(changed_chunk_ids)
+        added = True
+
+        while added:
+            added = False
+            for relation in relations:
+                if relation.target_chunk_id in impacted and relation.source_chunk_id not in impacted:
+                    impacted.add(relation.source_chunk_id)
+                    added = True
+
+        return impacted
