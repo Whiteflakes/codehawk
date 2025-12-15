@@ -611,6 +611,9 @@ class ContextEngine:
 
             neighbor_chunks = self.db.get_chunks_by_ids(list(neighbor_ids))
             for chunk in neighbor_chunks:
+                original_content = chunk.get("content")
+                chunk["full_content"] = original_content
+                chunk["content"] = chunk.get("skeleton_content") or original_content
                 chunk["relation_type"] = "graph_neighbor"
                 chunk["skeleton_only"] = True
                 all_related.append(chunk)
