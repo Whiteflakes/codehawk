@@ -3,7 +3,7 @@
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 import os
 from datetime import datetime
 
@@ -11,7 +11,7 @@ from codehawk.parser import TreeSitterParser
 from codehawk.chunker import CodeChunker, CodeChunk
 from codehawk.embeddings import EmbeddingGenerator
 from codehawk.database import Database
-from codehawk.graph import GraphAnalyzer, GraphUpdatePlanner
+from codehawk.graph import CodeRelation, GraphAnalyzer, GraphUpdatePlanner
 from codehawk.lineage import LineageTracker
 from codehawk.config import settings
 
