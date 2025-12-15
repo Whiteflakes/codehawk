@@ -1,8 +1,9 @@
 """Unit tests for code chunker."""
+from pathlib import Path
 
 import pytest
-from pathlib import Path
-from codehawk.chunker import CodeChunker, CodeChunk
+
+from codehawk.chunker import CodeChunk, CodeChunker
 
 
 def test_chunker_initialization():

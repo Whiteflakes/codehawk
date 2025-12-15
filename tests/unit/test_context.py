@@ -302,3 +302,77 @@ def test_index_file_links_commit_metadata(tmp_path, monkeypatch):
     assert engine.db.commit_args["commit_hash"] == "abc123"
     assert engine.db.commit_args["repository_id"] == 7
     assert engine.db.linked_commits == [(1, 99, "added")]
+
+
+def test_expand_with_graph_uses_skeleton_neighbors():
+    """Graph expansion should surface skeleton-only neighbors to save tokens."""
+
+    class GraphDb:
+        def get_relations_for_chunks(self, chunk_ids):
+            return [
+                {
+                    "source_chunk_id": 1,
+                    "target_chunk_id": 2,
+                    "relation_type": "calls",
+                    "metadata": {},
+                }
+            ]
+
+        def get_chunks_by_ids(self, chunk_ids):
+            return [
+                {
+                    "id": 2,
+                    "content": "def heavy_impl():\n    return 42",
+                    "skeleton_content": "def heavy_impl() -> int",
+                    "language": "python",
+                    "metadata": {},
+                    "file_path": "utils.py",
+                }
+            ]
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = GraphDb()
+
+    expansions = engine._expand_with_graph([{"id": 1}], hops=1)
+
+    assert expansions[0]["skeleton_only"] is True
+    assert expansions[0]["relation_type"] == "graph_neighbor"
+    assert expansions[0]["content"] == "def heavy_impl() -> int"
+    assert expansions[0]["full_content"].startswith("def heavy_impl():")
+
+
+def test_search_injects_global_symbol_hits(monkeypatch):
+    """Global/config symbols should be surfaced ahead of vector matches."""
+
+    class SymbolDb:
+        def search_chunks(self, *_, **__):
+            return []
+
+        def search_global_symbols(self, terms, repo_ids=None):
+            return [
+                {
+                    "symbol": "API_KEY",
+                    "chunk_id": 9,
+                    "content": "API_KEY = \"secret\"",
+                    "skeleton_content": "API_KEY = ...",
+                    "language": "python",
+                    "file_path": "config.py",
+                    "metadata": {},
+                }
+            ]
+
+        def get_relations_for_chunks(self, *_args, **_kwargs):
+            return []
+
+        def get_chunks_by_ids(self, *_args, **_kwargs):
+            return []
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = SymbolDb()
+    engine.embedder = type("Embedder", (), {"generate_embedding": lambda self, q: np.ones(4)})()
+
+    results = engine.search("API_KEY usage", graph_hops=0)
+
+    assert results
+    assert results[0]["boost_reason"] == "global_symbol"
+    assert results[0]["file_path"] == "config.py"
