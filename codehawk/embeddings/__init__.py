@@ -135,13 +135,9 @@ class EmbeddingGenerator:
         except Exception as e:
             raise RuntimeError(f"Error generating embedding: {e}") from e
 
-    def generate_embeddings(self, texts: List[str]) -> List[np.ndarray]:
-            logger.error(f"Error generating embedding: {e}")
-            return self._mock_embedding(text)
-
-    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> List[Optional[np.ndarray]]:
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> List[np.ndarray]:
         """
-        Generate embeddings for multiple texts.
+        Generate embeddings for multiple texts, with deterministic fallbacks when needed.
 
         Args:
             texts: List of texts to embed
@@ -149,15 +145,18 @@ class EmbeddingGenerator:
         Returns:
             List of embedding vectors
         """
-        if self.model is None:
-            self.load_model()
+        if not texts:
+            return []
 
-        try:
-            embeddings = self.model.encode(texts, convert_to_numpy=True)
-            embeddings_array = np.asarray(embeddings, dtype=np.float32)
-            return [emb for emb in embeddings_array]
-        except Exception as e:
-            raise RuntimeError(f"Error generating embeddings: {e}") from e
+        if self.model is None:
+            try:
+                self.load_model()
+            except RuntimeError as e:
+                logger.warning(
+                    "Embedding model could not be loaded (%s); returning mock embeddings", e
+                )
+                return [self._mock_embedding(text) for text in texts]
+
         if self.model is None:
             logger.warning("Embedding model not loaded, returning mock embeddings")
             return [self._mock_embedding(text) for text in texts]
@@ -167,9 +166,10 @@ class EmbeddingGenerator:
             for start in range(0, len(texts), batch_size):
                 batch = texts[start : start + batch_size]
                 batch_embeddings = self.model.encode(batch, convert_to_numpy=True)
-                results.extend(batch_embeddings)
+                batch_array = np.asarray(batch_embeddings, dtype=np.float32)
+                results.extend(batch_array)
 
-            return [emb.astype(np.float32) for emb in results]
+            return results
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
             return [self._mock_embedding(text) for text in texts]
