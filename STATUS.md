@@ -1,34 +1,27 @@
 # Release readiness summary
 
-This document is the authoritative release checklist for CodeHawk. It complements the installation and usage guidance in the README and replaces the previous IMPLEMENTATION notes.
+This document tracks the current readiness of CodeHawk for release.
 
-## Current capabilities
-- Tree-sitter–backed parsing for Python, JavaScript/TypeScript, Java, Go, and Rust, with graceful warnings when grammars are missing.
-- Structure-aware chunking that prefers semantic nodes (functions, classes, methods) and falls back to overlapped line windows when a parse tree is unavailable.
-- Embedding generation through `sentence-transformers` with deterministic offline fallbacks and a pluggable backend hook for custom models.
-- PostgreSQL storage (with pgvector) that tracks repositories, files, chunks, relations, and lineage, plus search and context-pack assembly for LLM callers.
-- Incremental-friendly indexing helpers that skip unchanged files via content hashing and remove deleted paths before writing new chunks and relations.
+## Current state
+- ✅ Core indexing, parsing, chunking, embedding, relation analysis, and lineage tracking paths are functional.
+- ✅ Unit test suite passes (`pytest`), and end-to-end fixtures will run automatically when `testcontainers`/Docker are available.
+- ✅ Embedding fallback logic and tree-sitter stubs allow offline/local development without crashes when models or native bindings are missing.
+- ⚠️ Deployments still depend on external services (PostgreSQL with pgvector, tree-sitter grammars, embedding model downloads) and are not bundled by default.
 
-## Resolved defects
-- Offline embedding fallback now produces deterministic vectors for tests while surfacing network errors clearly when model downloads fail.
-- Indexing now removes deleted files before inserting new chunks, keeping the graph and lineage tables consistent across incremental runs.
+## Open limitations
+- Tree-sitter grammars must be installed separately for each language; missing grammars fall back to line-based chunking.
+- Embedding downloads may require network access; offline mode is deterministic but suitable primarily for testing.
+- Search quality is based on vector/BM25 blending without rerankers.
+- API/MCP usage assumes a running PostgreSQL with pgvector and initialized schema.
 
-## Open limitations and blockers
-- Tree-sitter grammars must be installed separately; missing grammars disable semantic chunking for that language.
-- Embedding downloads depend on external network access; offline mode is suitable only for testing.
-- Search quality is limited to vector/BM25 blending without rerankers or snippet deduplication.
-- API, MCP, and CLI commands assume a running PostgreSQL with pgvector; there is no bundled container or migration tool, and authentication/authorization are out of scope.
-- Automated tests provide minimal coverage and do not exercise database writes, API surfaces, or long-running indexing flows.
+## Release checklist
+- [x] Run unit tests: `pytest`
+- [ ] Provision PostgreSQL with pgvector and set `CODEHAWK_DB_*` environment variables
+- [ ] Install required tree-sitter grammars for targeted languages
+- [ ] Ensure embedding model availability or enable offline deterministic mode
+- [ ] Initialize schema via `codehawk init-db` and smoke test indexing a sample repo
+- [ ] (Optional) Run e2e tests with Docker: `pytest tests/e2e` (requires `testcontainers`)
 
-## Release readiness checklist
-- [ ] PostgreSQL + pgvector provisioned and reachable using the connection string configured in environment variables (see README for `CODEHAWK_DB_*` settings).
-- [ ] Required tree-sitter grammars installed for each language you plan to index.
-- [ ] Embedding model available (or offline fallback explicitly accepted) and sized to `CODEHAWK_EMBEDDING_DIMENSION`.
-- [ ] Development and test dependencies installed via `pip install -r requirements-dev.txt` (or `uv pip install -r requirements-dev.txt`) before running the automated test suite.
-- [ ] Database schema initialized via `codehawk init-db` and smoke-tested by indexing a small repository through the CLI.
-- [ ] API, MCP, and CLI flows validated end-to-end against your environment (follow the usage examples in the README), with observability and retries in place for long indexing jobs.
-- [ ] Minimal integration verification covering indexing, search, and context-pack generation, either through automated tests or targeted manual checks.
-
-## Authoritative references
-- Primary usage guidance: [README](README.md) for installation, configuration, and CLI/API/MCP examples.
-- Defaults and detailed behavior: in-code settings in `codehawk/config.py` and component modules.
+## References
+- Usage, API, and CLI examples: [README](README.md)
+- Configuration defaults: `codehawk/config.py`
