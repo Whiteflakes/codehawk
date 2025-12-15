@@ -132,6 +132,8 @@ class DummyBatchDb:
     def __init__(self):
         self.inserted_chunks = []
         self.inserted_relations = 0
+        self.commit_args = None
+        self.linked_commits = []
 
     def insert_file(self, **kwargs):
         return 1
@@ -142,6 +144,26 @@ class DummyBatchDb:
 
     def insert_relation(self, **kwargs):
         self.inserted_relations += 1
+
+    def insert_commit(
+        self,
+        repository_id,
+        commit_hash,
+        author,
+        message,
+        timestamp,
+    ):
+        self.commit_args = {
+            "repository_id": repository_id,
+            "commit_hash": commit_hash,
+            "author": author,
+            "message": message,
+            "timestamp": timestamp,
+        }
+        return 99
+
+    def link_file_commit(self, file_id, commit_id, change_type="modified"):
+        self.linked_commits.append((file_id, commit_id, change_type))
 
 
 class DummyParser:
@@ -220,3 +242,48 @@ def test_index_file_batches_embeddings_and_inserts(tmp_path):
     assert engine.embedder.calls == 1
     assert len(engine.db.inserted_chunks) == 2
     assert all(len(ids) == 2 for ids in engine.graph_analyzer.received_chunk_ids)
+
+
+def test_index_file_links_commit_metadata(tmp_path, monkeypatch):
+    file_path = tmp_path / "module.py"
+    file_path.write_text("def a():\n    return 1")
+
+    chunks = [
+        CodeChunk(
+            content=file_path.read_text(),
+            file_path=str(file_path),
+            start_line=1,
+            end_line=2,
+            start_byte=0,
+            end_byte=len(file_path.read_text()),
+            chunk_type="function_definition",
+            language="python",
+            metadata={},
+        )
+    ]
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = DummyBatchDb()
+    engine.embedder = DummyBatchEmbedder()
+    engine.parser = DummyParser()
+    engine.chunker = DummyChunker(chunks)
+    engine.graph_analyzer = DummyGraphAnalyzer()
+
+    commit_time = datetime.utcnow()
+    monkeypatch.setattr(
+        engine,
+        "_resolve_file_commit",
+        lambda repo_path, file_path: {
+            "hash": "abc123",
+            "author": "User",
+            "message": "feat: add module",
+            "timestamp": commit_time,
+            "change_type": "added",
+        },
+    )
+
+    engine.index_file(repository_id=7, file_path=file_path, repo_path=tmp_path)
+
+    assert engine.db.commit_args["commit_hash"] == "abc123"
+    assert engine.db.commit_args["repository_id"] == 7
+    assert engine.db.linked_commits == [(1, 99, "added")]

@@ -1,9 +1,12 @@
 """Graph-based code relations analysis."""
 
+import ast
 import logging
-from typing import List, Dict, Any, Set
+from pathlib import Path
+from typing import List, Dict, Any, Set, Optional, Tuple
 from dataclasses import dataclass
 from codehawk.chunker import CodeChunk
+from codehawk.parser import TreeSitterParser
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,8 @@ class GraphAnalyzer:
     def __init__(self):
         """Initialize the graph analyzer."""
         self.relations: List[CodeRelation] = []
+        self.parser = TreeSitterParser()
+        self._symbol_index_cache: Optional[Tuple[Tuple[int, ...], Dict[str, Dict[str, Set[int]]]]] = None
 
     def analyze_imports(self, chunks: List[CodeChunk], chunk_ids: List[int]) -> List[CodeRelation]:
         """
@@ -36,24 +41,38 @@ class GraphAnalyzer:
         Returns:
             List of relations
         """
-        relations = []
-        
+        relations: List[CodeRelation] = []
+        symbol_index = self._get_symbol_index(chunks, chunk_ids)
+        seen: Set[Tuple[int, int, str]] = set()
+
         for i, chunk in enumerate(chunks):
             imports = self._extract_imports(chunk.content, chunk.language)
-            
+
             for imp in imports:
-                # Find chunks that might define this import
-                for j, target_chunk in enumerate(chunks):
-                    if i != j and self._chunk_defines(target_chunk, imp):
+                target_ids: Set[int] = set()
+                module = imp.get("module")
+                name = imp.get("name") or imp.get("import_name")
+
+                if module and module in symbol_index["modules"]:
+                    target_ids.update(symbol_index["modules"].get(module, set()))
+
+                if name:
+                    target_ids.update(symbol_index["functions"].get(name, set()))
+                    target_ids.update(symbol_index["classes"].get(name, set()))
+
+                for target_id in target_ids:
+                    key = (chunk_ids[i], target_id, "imports")
+                    if target_id != chunk_ids[i] and key not in seen:
+                        seen.add(key)
                         relations.append(
                             CodeRelation(
                                 source_chunk_id=chunk_ids[i],
-                                target_chunk_id=chunk_ids[j],
+                                target_chunk_id=target_id,
                                 relation_type="imports",
                                 metadata={
-                                    "import_name": imp,
+                                    "import_name": name or module,
                                     "source_file": chunk.file_path,
-                                    "target_file": target_chunk.file_path,
+                                    "target_file": self._symbol_index_file(symbol_index, target_id),
                                 },
                             )
                         )
@@ -71,25 +90,29 @@ class GraphAnalyzer:
         Returns:
             List of relations
         """
-        relations = []
+        relations: List[CodeRelation] = []
+        symbol_index = self._get_symbol_index(chunks, chunk_ids)
+        seen: Set[Tuple[int, int, str]] = set()
 
         for i, chunk in enumerate(chunks):
-            if chunk.chunk_type in ["function_definition", "method_definition"]:
+            if chunk.chunk_type in ["function_definition", "method_definition", "decorated_definition"]:
                 calls = self._extract_function_calls(chunk.content, chunk.language)
 
                 for call in calls:
-                    # Find chunks that define this function
-                    for j, target_chunk in enumerate(chunks):
-                        if i != j and self._is_function_definition(target_chunk, call):
+                    target_ids = symbol_index["functions"].get(call, set())
+                    for target_id in target_ids:
+                        key = (chunk_ids[i], target_id, "calls")
+                        if target_id != chunk_ids[i] and key not in seen:
+                            seen.add(key)
                             relations.append(
                                 CodeRelation(
                                     source_chunk_id=chunk_ids[i],
-                                    target_chunk_id=chunk_ids[j],
+                                    target_chunk_id=target_id,
                                     relation_type="calls",
                                     metadata={
                                         "function_name": call,
                                         "source_file": chunk.file_path,
-                                        "target_file": target_chunk.file_path,
+                                        "target_file": self._symbol_index_file(symbol_index, target_id),
                                     },
                                 )
                             )
@@ -107,114 +130,231 @@ class GraphAnalyzer:
         Returns:
             List of relations
         """
-        relations = []
+        relations: List[CodeRelation] = []
+        symbol_index = self._get_symbol_index(chunks, chunk_ids)
+        seen: Set[Tuple[int, int, str]] = set()
 
         for i, chunk in enumerate(chunks):
             if chunk.chunk_type == "class_definition":
                 base_classes = self._extract_base_classes(chunk.content, chunk.language)
 
                 for base_class in base_classes:
-                    # Find chunks that define this base class
-                    for j, target_chunk in enumerate(chunks):
-                        if i != j and self._is_class_definition(target_chunk, base_class):
+                    target_ids = symbol_index["classes"].get(base_class, set())
+                    for target_id in target_ids:
+                        key = (chunk_ids[i], target_id, "inherits")
+                        if target_id != chunk_ids[i] and key not in seen:
+                            seen.add(key)
                             relations.append(
                                 CodeRelation(
                                     source_chunk_id=chunk_ids[i],
-                                    target_chunk_id=chunk_ids[j],
+                                    target_chunk_id=target_id,
                                     relation_type="inherits",
                                     metadata={
                                         "class_name": base_class,
                                         "source_file": chunk.file_path,
-                                        "target_file": target_chunk.file_path,
+                                        "target_file": self._symbol_index_file(symbol_index, target_id),
                                     },
                                 )
                             )
 
         return relations
 
-    def _extract_imports(self, content: str, language: str) -> List[str]:
-        """Extract import statements from code."""
-        imports = []
+    def _get_symbol_index(
+        self, chunks: List[CodeChunk], chunk_ids: List[int]
+    ) -> Dict[str, Dict[str, Set[int]]]:
+        """Build (or reuse) a repository-wide symbol index for definition resolution."""
+
+        cache_key = (tuple(chunk_ids), tuple(hash(chunk.content) for chunk in chunks))
+        if self._symbol_index_cache and self._symbol_index_cache[0] == cache_key:
+            return self._symbol_index_cache[1]
+
+        index: Dict[str, Dict[str, Set[int]]] = {
+            "modules": {},
+            "functions": {},
+            "classes": {},
+            "files": {},
+        }
+
+        for chunk, chunk_id in zip(chunks, chunk_ids):
+            module_name = Path(chunk.file_path).stem
+            index["modules"].setdefault(module_name, set()).add(chunk_id)
+            index["files"][chunk_id] = chunk.file_path
+
+            for func in self._extract_function_definitions(chunk):
+                index["functions"].setdefault(func, set()).add(chunk_id)
+            for cls in self._extract_class_definitions(chunk):
+                index["classes"].setdefault(cls, set()).add(chunk_id)
+
+        self._symbol_index_cache = (cache_key, index)
+        return index
+
+    def _symbol_index_file(self, symbol_index: Dict[str, Dict[str, Set[int]]], chunk_id: int) -> str:
+        """Lookup file path for a chunk id from the symbol index."""
+
+        return symbol_index.get("files", {}).get(chunk_id, "")
+
+    def _extract_imports(self, content: str, language: str) -> List[Dict[str, str]]:
+        """Extract import statements using syntax-aware parsing when possible."""
 
         if language == "python":
+            try:
+                tree = ast.parse(content)
+                imports: List[Dict[str, str]] = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            imports.append({"module": alias.name.split(".")[0], "name": alias.asname or alias.name})
+                    elif isinstance(node, ast.ImportFrom):
+                        module = (node.module or "").split(".")[0]
+                        for alias in node.names:
+                            imports.append({"module": module, "name": alias.name})
+                return imports
+            except SyntaxError:
+                logger.debug("Failed to parse imports with ast; falling back to heuristics")
+
+        imports: List[Dict[str, str]] = []
+        if language in ["javascript", "typescript"]:
             for line in content.split("\n"):
                 line = line.strip()
-                if line.startswith("import "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        imports.append(parts[1].split(".")[0])
-                elif line.startswith("from "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        imports.append(parts[1].split(".")[0])
-
-        elif language in ["javascript", "typescript"]:
-            for line in content.split("\n"):
-                line = line.strip()
-                if "import " in line or "require(" in line:
-                    # Simple extraction - could be improved with proper parsing
-                    if "from" in line:
-                        parts = line.split("from")
-                        if len(parts) >= 2:
-                            module = parts[1].strip().strip("\"';").split("/")[-1]
-                            imports.append(module)
-
+                if line.startswith("import ") and "from" in line:
+                    try:
+                        module = line.split("from")[1].strip().strip("\"';")
+                        name = (
+                            line.split("import")[1]
+                            .split("from")[0]
+                            .strip()
+                            .strip("{}")
+                            .split(" as ")[0]
+                        )
+                        imports.append({"module": module.split("/")[-1], "name": name})
+                    except Exception:
+                        continue
         return imports
 
     def _extract_function_calls(self, content: str, language: str) -> List[str]:
-        """Extract function calls from code."""
-        calls = []
+        """Extract function calls using AST when available."""
 
-        # Simple heuristic - look for patterns like "function_name("
+        calls: Set[str] = set()
+
+        if language == "python":
+            try:
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        func = node.func
+                        if isinstance(func, ast.Name):
+                            calls.add(func.id)
+                        elif isinstance(func, ast.Attribute):
+                            calls.add(func.attr)
+                return list(calls)
+            except SyntaxError:
+                logger.debug("Failed to parse function calls with ast; falling back to regex")
+
         import re
-        pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
+
+        pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
         matches = re.finditer(pattern, content)
 
         for match in matches:
             func_name = match.group(1)
-            # Filter out common keywords
             if func_name not in ["if", "while", "for", "def", "class", "function"]:
-                calls.append(func_name)
+                calls.add(func_name)
 
-        return list(set(calls))
+        return list(calls)
 
     def _extract_base_classes(self, content: str, language: str) -> List[str]:
-        """Extract base classes from class definition."""
-        base_classes = []
+        """Extract base classes from class definition using AST when available."""
 
         if language == "python":
-            import re
-            pattern = r'class\s+\w+\s*\(([^)]+)\)'
-            match = re.search(pattern, content)
-            if match:
-                bases = match.group(1).split(",")
-                for base in bases:
-                    base = base.strip().split(".")[-1]
-                    if base and base != "object":
-                        base_classes.append(base)
+            try:
+                tree = ast.parse(content)
+                bases: List[str] = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        for base in node.bases:
+                            if isinstance(base, ast.Name):
+                                bases.append(base.id)
+                            elif isinstance(base, ast.Attribute):
+                                bases.append(base.attr)
+                return bases
+            except SyntaxError:
+                logger.debug("Failed to parse inheritance with ast; falling back to regex")
+
+        import re
+
+        pattern = r'class\s+\w+\s*\(([^)]+)\)'
+        match = re.search(pattern, content)
+        if not match:
+            return []
+
+        base_classes: List[str] = []
+        bases = match.group(1).split(",")
+        for base in bases:
+            name = base.strip().split(".")[-1]
+            if name and name != "object":
+                base_classes.append(name)
 
         return base_classes
 
-    def _chunk_defines(self, chunk: CodeChunk, name: str) -> bool:
-        """Check if chunk defines a given name."""
-        # Simple heuristic - check if name appears in chunk as a definition
-        if chunk.chunk_type in ["function_definition", "class_definition"]:
-            return name in chunk.content.split("\n")[0]
-        return False
+    def _extract_function_definitions(self, chunk: CodeChunk) -> Set[str]:
+        """Extract defined function names from a chunk using syntax-aware parsing."""
 
-    def _is_function_definition(self, chunk: CodeChunk, name: str) -> bool:
-        """Check if chunk is a function definition with given name."""
-        if chunk.chunk_type in ["function_definition", "method_definition"]:
-            first_line = chunk.content.split("\n")[0]
-            return name in first_line
-        return False
+        names: Set[str] = set()
+        if chunk.language == "python":
+            try:
+                tree = ast.parse(chunk.content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        names.add(node.name)
+            except SyntaxError:
+                logger.debug("Failed to parse function definitions with ast")
 
-    def _is_class_definition(self, chunk: CodeChunk, name: str) -> bool:
-        """Check if chunk is a class definition with given name."""
-        if chunk.chunk_type == "class_definition":
-            first_line = chunk.content.split("\n")[0]
-            return name in first_line
-        return False
+        tree = self.parser.parse_code(chunk.content, chunk.language) if hasattr(self.parser, "parse_code") else None
+        if tree:
+            try:
+                for func in self.parser.extract_functions(tree, chunk.language):
+                    names.add(func.get("name", ""))
+            except Exception:
+                logger.debug("Failed to extract functions via tree-sitter")
+
+        if not names and chunk.chunk_type in ["function_definition", "method_definition", "decorated_definition"]:
+            header = chunk.content.split("\n")[0]
+            if "def " in header:
+                candidate = header.split("def ")[1].split("(")[0].strip()
+                if candidate:
+                    names.add(candidate)
+
+        return {name for name in names if name}
+
+    def _extract_class_definitions(self, chunk: CodeChunk) -> Set[str]:
+        """Extract defined class names from a chunk using syntax-aware parsing."""
+
+        names: Set[str] = set()
+        if chunk.language == "python":
+            try:
+                tree = ast.parse(chunk.content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        names.add(node.name)
+            except SyntaxError:
+                logger.debug("Failed to parse class definitions with ast")
+
+        tree = self.parser.parse_code(chunk.content, chunk.language) if hasattr(self.parser, "parse_code") else None
+        if tree:
+            try:
+                for cls in self.parser.extract_classes(tree, chunk.language):
+                    names.add(cls.get("name", ""))
+            except Exception:
+                logger.debug("Failed to extract classes via tree-sitter")
+
+        if not names and chunk.chunk_type == "class_definition":
+            header = chunk.content.split("\n")[0]
+            if "class " in header:
+                candidate = header.split("class ")[1].split("(")[0].strip().strip(":")
+                if candidate:
+                    names.add(candidate)
+
+        return {name for name in names if name}
 
 
 class GraphUpdatePlanner:
