@@ -1,10 +1,38 @@
 """Code chunking for embedding generation."""
 
+import importlib.util
 import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
-import tree_sitter
+
+TREE_SITTER_AVAILABLE = importlib.util.find_spec("tree_sitter") is not None
+
+if TREE_SITTER_AVAILABLE:
+    import tree_sitter
+else:
+    class _DummyNode:
+        def __init__(self):
+            self.type = ""
+            self.start_byte = 0
+            self.end_byte = 0
+            self.start_point = (0, 0)
+            self.end_point = (0, 0)
+            self.children = []
+
+        def child_by_field_name(self, *_args, **_kwargs):
+            return None
+
+    class _DummyTree:
+        def __init__(self):
+            self.root_node = _DummyNode()
+
+    class _DummyTreeSitterModule:
+        Node = _DummyNode
+        Tree = _DummyTree
+        Parser = object
+
+    tree_sitter = _DummyTreeSitterModule()
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +116,9 @@ class CodeChunker:
         Returns:
             List of code chunks
         """
+        if not TREE_SITTER_AVAILABLE or tree is None:
+            return []
+
         chunks = []
         source_bytes = source_code.encode("utf-8")
 
