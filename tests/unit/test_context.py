@@ -82,12 +82,17 @@ class DummyIndexDatabase:
         self.existing_files = existing_files
         self.deleted = []
         self.files_inserted = []
+        self.overview_called = False
 
     def get_files_for_repository(self, repository_id):
         return self.existing_files
 
     def delete_files(self, repository_id, paths):
         self.deleted.extend(paths)
+
+    def get_repository_skeletons(self, repository_id):
+        self.overview_called = True
+        return [{"file_path": "app.py", "skeleton": "def main(): ..."}]
 
 
 def test_index_directory_skips_unchanged(tmp_path, monkeypatch):
@@ -114,6 +119,16 @@ def test_index_directory_skips_unchanged(tmp_path, monkeypatch):
 
     assert calls["indexed"] == 0
     assert engine.db.deleted == []
+
+
+def test_repository_overview_uses_skeletons():
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = DummyIndexDatabase(existing_files={})
+
+    overview = engine.get_repository_overview(1)
+
+    assert engine.db.overview_called
+    assert overview[0]["file_path"] == "app.py"
 
 
 class DummyBatchEmbedder:
@@ -287,3 +302,77 @@ def test_index_file_links_commit_metadata(tmp_path, monkeypatch):
     assert engine.db.commit_args["commit_hash"] == "abc123"
     assert engine.db.commit_args["repository_id"] == 7
     assert engine.db.linked_commits == [(1, 99, "added")]
+
+
+def test_expand_with_graph_uses_skeleton_neighbors():
+    """Graph expansion should surface skeleton-only neighbors to save tokens."""
+
+    class GraphDb:
+        def get_relations_for_chunks(self, chunk_ids):
+            return [
+                {
+                    "source_chunk_id": 1,
+                    "target_chunk_id": 2,
+                    "relation_type": "calls",
+                    "metadata": {},
+                }
+            ]
+
+        def get_chunks_by_ids(self, chunk_ids):
+            return [
+                {
+                    "id": 2,
+                    "content": "def heavy_impl():\n    return 42",
+                    "skeleton_content": "def heavy_impl() -> int",
+                    "language": "python",
+                    "metadata": {},
+                    "file_path": "utils.py",
+                }
+            ]
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = GraphDb()
+
+    expansions = engine._expand_with_graph([{"id": 1}], hops=1)
+
+    assert expansions[0]["skeleton_only"] is True
+    assert expansions[0]["relation_type"] == "graph_neighbor"
+    assert expansions[0]["content"] == "def heavy_impl() -> int"
+    assert expansions[0]["full_content"].startswith("def heavy_impl():")
+
+
+def test_search_injects_global_symbol_hits(monkeypatch):
+    """Global/config symbols should be surfaced ahead of vector matches."""
+
+    class SymbolDb:
+        def search_chunks(self, *_, **__):
+            return []
+
+        def search_global_symbols(self, terms, repo_ids=None):
+            return [
+                {
+                    "symbol": "API_KEY",
+                    "chunk_id": 9,
+                    "content": "API_KEY = \"secret\"",
+                    "skeleton_content": "API_KEY = ...",
+                    "language": "python",
+                    "file_path": "config.py",
+                    "metadata": {},
+                }
+            ]
+
+        def get_relations_for_chunks(self, *_args, **_kwargs):
+            return []
+
+        def get_chunks_by_ids(self, *_args, **_kwargs):
+            return []
+
+    engine = ContextEngine.__new__(ContextEngine)
+    engine.db = SymbolDb()
+    engine.embedder = type("Embedder", (), {"generate_embedding": lambda self, q: np.ones(4)})()
+
+    results = engine.search("API_KEY usage", graph_hops=0)
+
+    assert results
+    assert results[0]["boost_reason"] == "global_symbol"
+    assert results[0]["file_path"] == "config.py"

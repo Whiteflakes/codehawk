@@ -253,6 +253,7 @@ class ContextEngine:
             chunk_records.append(
                 {
                     "content": chunk.content,
+                    "skeleton_content": chunk.skeleton,
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     "start_byte": chunk.start_byte,
@@ -265,6 +266,20 @@ class ContextEngine:
             )
 
         chunk_ids = self.db.insert_chunks_batch(file_id=file_id, chunks=chunk_records)
+
+        # Capture global symbols/constants for ranking boosts
+        try:
+            globals_found = self._extract_global_symbols(source_code, language)
+            for chunk, chunk_id in zip(filtered_chunks, chunk_ids):
+                for symbol in globals_found:
+                    self.db.insert_global_symbol(
+                        file_id=file_id,
+                        chunk_id=chunk_id,
+                        name=symbol,
+                        metadata={"file_path": str(relative_path)},
+                    )
+        except Exception as exc:  # pragma: no cover - defensive best-effort
+            logger.debug(f"Skipping global symbol capture for {file_path}: {exc}")
 
         self._record_file_lineage(repo_path, file_path, repository_id, file_id)
 
@@ -391,6 +406,30 @@ class ContextEngine:
             logger.debug(f"Skipping lineage linking for {file_path}: {exc}")
             return None
 
+    def _extract_global_symbols(self, source_code: str, language: str) -> List[str]:
+        """Identify module-level constants/configs for boosting."""
+
+        symbols: List[str] = []
+        if language == "python":
+            import ast
+
+            try:
+                tree = ast.parse(source_code)
+            except SyntaxError:
+                return symbols
+
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id.isupper():
+                            symbols.append(target.id)
+                elif isinstance(node, ast.AnnAssign):
+                    target = node.target
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        symbols.append(target.id)
+
+        return symbols
+
     def _compute_fingerprint(
         self, repo_path: Path, file_path: Path, content: str
     ) -> Optional[str]:
@@ -421,6 +460,7 @@ class ContextEngine:
         boost_top_level: float = 0.05,
         boost_recent_edit: float = 0.05,
         filter_match_boost: float = 0.02,
+        graph_hops: int = 1,
     ) -> List[Dict[str, Any]]:
         """
         Search for code chunks similar to query.
@@ -474,6 +514,36 @@ class ContextEngine:
             boost_recent_edit=boost_recent_edit,
             filter_match_boost=filter_match_boost,
         )
+
+        # Boost global symbols/config constants when query tokens reference them
+        query_terms = [token.strip(" ,.:()") for token in query.split() if token]
+        if query_terms:
+            try:
+                global_hits = self.db.search_global_symbols(query_terms, repository_ids or ([repository_id] if repository_id else None))
+                for hit in global_hits:
+                    results.insert(
+                        0,
+                        {
+                            "id": hit.get("chunk_id"),
+                            "content": hit.get("content"),
+                            "skeleton_content": hit.get("skeleton_content"),
+                            "file_path": hit.get("file_path"),
+                            "metadata": hit.get("metadata", {}),
+                            "chunk_type": "global",
+                            "language": hit.get("language"),
+                            "boost_reason": "global_symbol",
+                            "combined_score": 1.5,
+                        },
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Global symbol search failed: {exc}")
+        if graph_hops > 0:
+            try:
+                expansions = self._expand_with_graph(results, graph_hops)
+                results.extend(expansions)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Graph expansion failed: {exc}")
+
         return results
 
     def get_context_pack(
@@ -519,6 +589,45 @@ class ContextEngine:
                 logger.debug(f"Error fetching lineage for context pack: {e}")
 
         return context_pack
+
+    def _expand_with_graph(self, seeds: List[Dict[str, Any]], hops: int) -> List[Dict[str, Any]]:
+        """Return related chunks using graph edges (skeleton view for neighbors)."""
+
+        if not self.db or not seeds:
+            return []
+
+        hop_ids = {chunk.get("id") for chunk in seeds if chunk.get("id")}
+        all_related: List[Dict[str, Any]] = []
+
+        for _ in range(hops):
+            relations = self.db.get_relations_for_chunks(list(hop_ids))
+            neighbor_ids = set()
+            for rel in relations:
+                neighbor_ids.add(rel["source_chunk_id"])
+                neighbor_ids.add(rel["target_chunk_id"])
+            neighbor_ids -= hop_ids
+            if not neighbor_ids:
+                break
+
+            neighbor_chunks = self.db.get_chunks_by_ids(list(neighbor_ids))
+            for chunk in neighbor_chunks:
+                chunk["relation_type"] = "graph_neighbor"
+                chunk["skeleton_only"] = True
+                skeleton = chunk.get("skeleton_content")
+                if skeleton:
+                    chunk["full_content"] = chunk.get("content")
+                    chunk["content"] = skeleton
+                all_related.append(chunk)
+            hop_ids.update(neighbor_ids)
+
+        return all_related
+
+    def get_repository_overview(self, repository_id: int) -> List[Dict[str, Any]]:
+        """Expose a skeletonized repository overview for passive MCP resources."""
+
+        if not self.db:
+            raise RuntimeError("Database not initialized")
+        return self.db.get_repository_skeletons(repository_id)
 
     def _get_code_files(self, directory: Path) -> List[Path]:
         """

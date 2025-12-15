@@ -1,6 +1,7 @@
-from datetime import datetime
-import numpy as np
 import time
+from datetime import datetime
+
+import numpy as np
 
 from codehawk.database import Database
 
@@ -35,8 +36,8 @@ class FakeConnection:
 
 def test_search_chunks_hybrid_filters_and_ordering():
     rows = [
-        (1, "foo", 1, 5, "code", "python", {}, "file1.py", "repo", 0.70, 0.20),
-        (2, "bar", 6, 9, "code", "python", {}, "file2.py", "repo", 0.40, 0.90),
+        (1, "foo", "sig foo", 1, 5, "code", "python", {}, "file1.py", "repo", 0.70, 0.20),
+        (2, "bar", "sig bar", 6, 9, "code", "python", {}, "file2.py", "repo", 0.40, 0.90),
     ]
 
     db = Database.__new__(Database)
@@ -73,8 +74,8 @@ def reciprocal_rank(ranking, relevant_id):
 
 def test_hybrid_search_improves_mrr_and_stays_fast():
     rows = [
-        (1, "foo", 1, 5, "code", "python", {}, "file1.py", "repo", 0.70, 0.10),
-        (2, "bar", 6, 9, "code", "python", {}, "file2.py", "repo", 0.40, 0.90),
+        (1, "foo", "sig foo", 1, 5, "code", "python", {}, "file1.py", "repo", 0.70, 0.10),
+        (2, "bar", "sig bar", 6, 9, "code", "python", {}, "file2.py", "repo", 0.40, 0.90),
     ]
 
     db = Database.__new__(Database)
@@ -107,6 +108,7 @@ def test_reranker_and_deduplication_boost_mrr_without_huge_latency():
         (
             1,
             "def helper():\n    return 1",
+            "def helper(): ...",
             1,
             3,
             "function_definition",
@@ -120,6 +122,7 @@ def test_reranker_and_deduplication_boost_mrr_without_huge_latency():
         (
             2,
             "def helper():\n    return 1",
+            "def helper(): ...",
             10,
             12,
             "function_definition",
@@ -133,6 +136,7 @@ def test_reranker_and_deduplication_boost_mrr_without_huge_latency():
         (
             3,
             "class Service:\n    pass",
+            "class Service: ...",
             20,
             25,
             "class_definition",
