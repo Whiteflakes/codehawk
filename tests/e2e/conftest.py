@@ -5,6 +5,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip(
+    "testcontainers.postgres", reason="testcontainers is required for e2e tests"
+)
 from testcontainers.postgres import PostgresContainer
 
 from codehawk.context import ContextEngine
