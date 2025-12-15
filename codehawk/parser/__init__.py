@@ -1,10 +1,33 @@
 """Tree-sitter parser for code analysis."""
 
 import importlib
+import importlib.util
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-import tree_sitter
+
+TREE_SITTER_AVAILABLE = importlib.util.find_spec("tree_sitter") is not None
+
+if TREE_SITTER_AVAILABLE:
+    import tree_sitter
+else:
+    class _DummyLanguage:
+        def query(self, *_args, **_kwargs):
+            raise RuntimeError("tree-sitter is not installed")
+
+    class _DummyParser:
+        def __init__(self, *_args, **_kwargs):
+            self.language = None
+
+        def parse(self, *_args, **_kwargs):
+            return None
+
+    class _DummyTreeSitterModule:
+        Language = _DummyLanguage
+        Parser = _DummyParser
+        Tree = object
+
+    tree_sitter = _DummyTreeSitterModule()
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +56,10 @@ class TreeSitterParser:
         """Initialize tree-sitter languages."""
         # Note: In production, you would build language binaries
         # For now, we'll handle gracefully if languages aren't available
+        if not TREE_SITTER_AVAILABLE:
+            logger.warning("tree-sitter not installed; semantic parsing disabled")
+            return
+
         language_modules = [
             ("python", "tree_sitter_python", "tree-sitter-python"),
             ("javascript", "tree_sitter_javascript", "tree-sitter-javascript"),
