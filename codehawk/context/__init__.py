@@ -613,10 +613,6 @@ class ContextEngine:
             for chunk in neighbor_chunks:
                 chunk["relation_type"] = "graph_neighbor"
                 chunk["skeleton_only"] = True
-                skeleton = chunk.get("skeleton_content")
-                if skeleton:
-                    chunk["full_content"] = chunk.get("content")
-                    chunk["content"] = skeleton
                 all_related.append(chunk)
             hop_ids.update(neighbor_ids)
 
