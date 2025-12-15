@@ -319,13 +319,6 @@ pytest tests/e2e
 End-to-end tests spin up a temporary PostgreSQL with pgvector using `testcontainers`. If Docker or the image is unavailable, the
 suite will be skipped automatically and unit tests can still be run locally or in CI.
 
-## Release readiness
-
-Before publishing a release or deploying to production, review the latest status notes and run through the release checklist:
-
-- [STATUS.md](STATUS.md) — current verification state and outstanding items
-- [RELEASE.md](RELEASE.md) — step-by-step checklist for preparing and validating an environment
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
