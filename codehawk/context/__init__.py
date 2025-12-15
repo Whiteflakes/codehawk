@@ -163,11 +163,10 @@ class ContextEngine:
         repo_path: Path,
         fingerprint: Optional[str] = None,
         reconcile: bool = False,
-    ) -> Dict[str, Any]:
         source_code: Optional[str] = None,
         content_hash: Optional[str] = None,
         modified_at: Optional[datetime] = None,
-    ):
+    ) -> Dict[str, Any]:
         """
         Index a single file.
 
